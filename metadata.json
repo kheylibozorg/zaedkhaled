@@ -1,0 +1,6 @@
+{
+  "name": "Apex Desk",
+  "description": "Mechanical Price-Action Autotrader with FTC Limit Orders, Style-Based Queue Invalidation, and Safe Position Cap",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
