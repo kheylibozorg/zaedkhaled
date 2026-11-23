@@ -234,6 +234,7 @@ export function LimitOrdersTable({
     max_wait_bars: number;
     status: string;
     cancel_reason?: string | null;
+    reason?: string | null;
     created_at: string;
   }>;
   empty: string;
@@ -266,11 +267,19 @@ export function LimitOrdersTable({
           {rows.map((r) => {
             const isPending = r.status === "pending";
             const isFilled = r.status === "filled";
+            const isPreArm = typeof r.reason === "string" && /pre-arm/i.test(r.reason);
             return (
               <tr key={r.id} className="border-b border-border/60">
                 <td className="px-3 py-2.5 text-fg">{r.symbol.replace("USDT", "")}</td>
                 <td className="px-3 py-2.5 text-muted">{r.timeframe}</td>
-                <td className="px-3 py-2.5 text-muted">{indicatorLabel(r.indicator)}</td>
+                <td className="px-3 py-2.5 text-muted">
+                  <span>{indicatorLabel(r.indicator)}</span>
+                  {isPreArm ? (
+                    <span className="ms-1.5 text-[10px] font-sans uppercase tracking-wider text-accent">
+                      {fa ? "پیش‌لیمیت" : "pre-arm"}
+                    </span>
+                  ) : null}
+                </td>
                 <td className="px-3 py-2.5">
                   <SideBadge side={r.side} />
                 </td>

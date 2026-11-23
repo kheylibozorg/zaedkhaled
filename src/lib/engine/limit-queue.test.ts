@@ -8,6 +8,7 @@ import {
   resolveLimitTtlBars,
   type PendingLimitSpec,
 } from "./limit-queue.ts";
+import type { PreArmedSetup } from "./pre-arm.ts";
 import { TF_MS, type ArmedSetup, type Bar } from "./types.ts";
 
 const T0 = Date.UTC(2025, 0, 1);
@@ -291,5 +292,66 @@ describe("evaluatePendingLimit — style invalidation & fills", () => {
       currentArmed: undefined,
     });
     assert.deepEqual(res, { action: "keep", barsElapsed: 0 });
+  });
+
+  it("handles Pre-Arm limits: keeps on matching pre-arm or same-side armed upgrade, cancels on pattern fail", () => {
+    const preOrder = baseOrder({
+      reason: "APEX 1.5R second-test support · Pre-arm FTC limit",
+    });
+    const preSetup: PreArmedSetup = {
+      ...matchingArmed(),
+      phase: "pre-arm",
+      levelBarTime: T0 - 5 * STEP,
+      matchTolerance: 1.5,
+      reason: preOrder.reason!,
+    };
+    const bars = [
+      barAt(0, 102, 104, 101, 103),
+      barAt(1, 103, 104, 101.2, 102),
+    ];
+
+    assert.deepEqual(
+      evaluatePendingLimit({
+        order: preOrder,
+        closedBars: bars,
+        ttlBars: 8,
+        gateMuted: false,
+        capReached: false,
+        duplicateHeld: false,
+        currentArmed: null,
+        currentPreArmed: preSetup,
+      }),
+      { action: "keep", barsElapsed: 1 },
+    );
+
+    // Upgraded to standard armed setup -> still keep
+    assert.deepEqual(
+      evaluatePendingLimit({
+        order: preOrder,
+        closedBars: bars,
+        ttlBars: 8,
+        gateMuted: false,
+        capReached: false,
+        duplicateHeld: false,
+        currentArmed: matchingArmed(),
+        currentPreArmed: null,
+      }),
+      { action: "keep", barsElapsed: 1 },
+    );
+
+    // Pattern failed before fill -> cancel immediately
+    assert.deepEqual(
+      evaluatePendingLimit({
+        order: preOrder,
+        closedBars: bars,
+        ttlBars: 8,
+        gateMuted: false,
+        capReached: false,
+        duplicateHeld: false,
+        currentArmed: null,
+        currentPreArmed: null,
+      }),
+      { action: "cancel", cancelReason: "pattern failed", barsElapsed: 1 },
+    );
   });
 });

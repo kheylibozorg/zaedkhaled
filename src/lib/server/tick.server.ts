@@ -44,6 +44,13 @@ import {
   parseEntryMode,
   resolveLimitTtlBars,
 } from "@/lib/engine/limit-queue";
+import {
+  findPreArmedSetup,
+  isPreArmReason,
+  preArmMatchesOrder,
+  scanPreArmedClosed,
+  type PreArmedSetup,
+} from "@/lib/engine/pre-arm";
 import { FEE_BPS, HTF2_OF, HTF_OF, TF_MS, WARMUP, type IndicatorName, type KlineTf, type Timeframe, type VenueId } from "@/lib/engine/types";
 import {
   dueTimeframes,
@@ -77,6 +84,7 @@ import {
   listOpenPositions,
   listOrphanFills,
   listPendingLimitOrders,
+  listRecentLimitOrders,
   listUniverse,
   logScan,
   markLimitOrderFilled,
@@ -1176,18 +1184,36 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         const htfBars = pendingBarsMap.get(`${o.symbol}|${HTF_OF[tf]}`) ?? [];
         const htf2Bars = pendingBarsMap.get(`${o.symbol}|${HTF2_OF[tf]}`) ?? [];
         let currentArmed: ArmedSetup | null | undefined = undefined;
+        let currentPreArmed: PreArmedSetup | null | undefined = undefined;
+        const preArmOrder = isPreArmReason(o.reason);
         if (bars.length >= MIN_BARS) {
           try {
+            const htfOpt = htfBars.length > 20 ? htfBars : undefined;
+            const htf2Opt = htf2Bars.length > 10 ? htf2Bars : undefined;
             const res = runIndicator(
               bars,
               tf,
               o.indicator as IndicatorName,
-              htfBars.length > 20 ? htfBars : undefined,
-              htf2Bars.length > 10 ? htf2Bars : undefined,
+              htfOpt,
+              htf2Opt,
             );
             currentArmed = res.armedSetup ?? null;
+            if (preArmOrder) {
+              if (currentArmed && currentArmed.side === side) {
+                currentPreArmed = null;
+              } else {
+                currentPreArmed = findPreArmedSetup(
+                  bars,
+                  tf,
+                  o.indicator as IndicatorName,
+                  htfOpt,
+                  htf2Opt,
+                );
+              }
+            }
           } catch {
             currentArmed = undefined;
+            currentPreArmed = undefined;
           }
         }
         const gateMuted =
@@ -1206,6 +1232,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             beAtR: o.be_at_r,
             armedBarTime: Number(o.armed_bar_time),
             ftcWait: Number(o.ftc_wait) || 8,
+            reason: o.reason,
           },
           closedBars: bars,
           ttlBars: resolveLimitTtlBars(settings.limit_ttl_bars, o.ftc_wait),
@@ -1214,6 +1241,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           htfCapReached: htfMax > 0 && htfOpen >= htfMax,
           duplicateHeld: held.has(coin),
           currentArmed,
+          currentPreArmed,
         });
 
         if (evalRes.action === "cancel") {
@@ -1419,9 +1447,16 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     reason: string;
     barTime: number;
   };
-  type FoundArmed = ArmedSetup & { symbol: string; timeframe: Timeframe; lastClosedBarTime: number };
+  type FoundArmed = ArmedSetup & {
+    symbol: string;
+    timeframe: Timeframe;
+    lastClosedBarTime: number;
+    phase?: "pre-arm";
+    matchTolerance?: number;
+  };
   const found: Found[] = [];
   const foundArmed: FoundArmed[] = [];
+  const foundPreArmed: FoundArmed[] = [];
   const seenSig = new Set<string>();
   const seenArmed = new Set<string>();
   const deadline = t0 + tickBudgetMs();
@@ -1477,19 +1512,32 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       any = true;
       const names = scanNames(tf, engineGates);
       if (entryMode === "limit") {
-        const armedList = scanArmedClosed(
-          closedBars,
-          tf,
-          htfClosed.length > 20 ? htfClosed : undefined,
-          htf2Closed.length > 10 ? htf2Closed : undefined,
-          names,
-        );
+        const htfOpt = htfClosed.length > 20 ? htfClosed : undefined;
+        const htf2Opt = htf2Closed.length > 10 ? htf2Closed : undefined;
+        const armedList = scanArmedClosed(closedBars, tf, htfOpt, htf2Opt, names);
+        const preArmedList = scanPreArmedClosed(closedBars, tf, htfOpt, htf2Opt, names);
         const lastClosedBarTime = closedBars[closedBars.length - 1]!.time;
+        const armedIndHere = new Set<string>();
         for (const a of armedList) {
+          armedIndHere.add(a.indicator);
           const key = `${asset.symbol}|${tf}|${a.indicator}|${a.armedBarTime}`;
           if (seenArmed.has(key)) continue;
           seenArmed.add(key);
           foundArmed.push({ ...a, symbol: asset.symbol, timeframe: tf, lastClosedBarTime });
+        }
+        for (const pre of preArmedList) {
+          if (armedIndHere.has(pre.indicator)) continue;
+          const key = `${asset.symbol}|${tf}|${pre.indicator}|${pre.armedBarTime}`;
+          if (seenArmed.has(key)) continue;
+          seenArmed.add(key);
+          foundPreArmed.push({
+            ...pre,
+            symbol: asset.symbol,
+            timeframe: tf,
+            lastClosedBarTime,
+            phase: "pre-arm",
+            matchTolerance: pre.matchTolerance,
+          });
         }
       } else {
         const sigs = scanBarClosed(
@@ -1561,7 +1609,8 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     }
   }
 
-  signals = entryMode === "limit" ? foundArmed.length : found.length;
+  const queuedCandidates = foundArmed.length || foundPreArmed.length ? [...foundArmed, ...foundPreArmed] : [];
+  signals = entryMode === "limit" ? queuedCandidates.length : found.length;
   const remainingSlots = Math.max(0, maxPos - openCount);
   let used = 0;
   const capitalPctDefault = Number(settings.capital_pct) || DEFAULT_CAPITAL_PCT;
@@ -1582,18 +1631,48 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     return n;
   }
 
-  if (entryMode === "limit" && foundArmed.length) {
+  if (entryMode === "limit" && queuedCandidates.length) {
     const activeAfterRecon = await listPendingLimitOrders();
+    const recentCancelledLimits = foundPreArmed.length ? await listRecentLimitOrders(80).catch(() => []) : [];
     const pendingCoins = coinsOf(activeAfterRecon.map((o) => o.symbol));
     let pendingCount = activeAfterRecon.length;
     let htfPendingCount = countHtfOpen(activeAfterRecon.map((o) => o.timeframe));
     let reservedPendingMargin = activeAfterRecon.reduce((accM, o) => accM + Math.max(0, Number(o.margin_usd) || 0), 0);
 
-    for (const armed of foundArmed) {
+    for (const armed of queuedCandidates) {
       const coin = fillCoin(armed.symbol);
       const ttlBars = resolveLimitTtlBars(settings.limit_ttl_bars, armed.ftcWait);
       const barsSinceArm = Math.max(0, Math.round((armed.lastClosedBarTime - armed.armedBarTime) / TF_MS[armed.timeframe]));
       if (barsSinceArm >= ttlBars) continue;
+      if (armed.phase === "pre-arm" && recentCancelledLimits.length) {
+        const cooldownMs = ttlBars * TF_MS[armed.timeframe];
+        const recentlyStoppedSameLevel = recentCancelledLimits.some((r) => {
+          if (r.status !== "cancelled" || !isPreArmReason(r.reason)) return false;
+          if (
+            r.symbol !== armed.symbol ||
+            r.timeframe !== armed.timeframe ||
+            r.indicator !== armed.indicator ||
+            r.side !== armed.side
+          ) {
+            return false;
+          }
+          if (
+            r.cancel_reason !== "queue expired" &&
+            r.cancel_reason !== "pattern failed" &&
+            r.cancel_reason !== "sl engulfed" &&
+            r.cancel_reason !== "target reached without RTP"
+          ) {
+            return false;
+          }
+          const closedMs = r.closed_at ? Date.parse(r.closed_at) : Date.parse(r.updated_at);
+          if (!Number.isFinite(closedMs) || nowMs - closedMs > cooldownMs) return false;
+          return preArmMatchesOrder(Number(r.entry), {
+            entry: armed.entry,
+            matchTolerance: armed.matchTolerance ?? armed.entry * 0.002,
+          });
+        });
+        if (recentlyStoppedSameLevel) continue;
+      }
 
       const gateCheck = canQueueLimitOrder({
         safeLimitMode,

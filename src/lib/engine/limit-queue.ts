@@ -1,5 +1,10 @@
 import { isHtfTf, clampHtfMaxPositions, clampMaxPositions } from "./fill-gates.ts";
 import { barsAfterFill } from "./paper.ts";
+import {
+  isPreArmReason,
+  preArmMatchesOrder,
+  type PreArmedSetup,
+} from "./pre-arm.ts";
 import { TF_MS, type ArmedSetup, type Bar, type IndicatorName, type Side, type Timeframe } from "./types.ts";
 
 export type EntryMode = "limit" | "market";
@@ -95,6 +100,7 @@ export type PendingLimitSpec = {
   beAtR?: number | null;
   armedBarTime: number;
   ftcWait: number;
+  reason?: string | null;
 };
 
 export type LimitEvaluation =
@@ -103,7 +109,7 @@ export type LimitEvaluation =
   | { action: "cancel"; cancelReason: LimitCancelReason; barsElapsed: number; atBarTime?: number };
 
 /**
- * Evaluates a queued (unfilled) FTC limit order against desk caps, style invalidations,
+ * Evaluates a queued (unfilled) FTC / Pre-Arm limit order against desk caps, style invalidations,
  * indicator pattern persistence, and queue TTL.
  *
  * Style rules enforced without altering indicator math:
@@ -111,7 +117,7 @@ export type LimitEvaluation =
  * 2. If price breaches SL / origin zone before tagging entry -> "sl engulfed".
  * 3. If price reaches TP without returning to FTC -> "target reached without RTP".
  * 4. If queue duration exceeds TTL bars -> "queue expired".
- * 5. If the closed-bar indicator no longer holds the same-side armed setup -> "pattern failed".
+ * 5. If the closed-bar indicator no longer holds the same-side armed (or matching pre-arm) setup -> "pattern failed".
  */
 export function evaluatePendingLimit(opts: {
   order: PendingLimitSpec;
@@ -123,6 +129,8 @@ export function evaluatePendingLimit(opts: {
   duplicateHeld: boolean;
   /** undefined = closed bars unavailable / indicator not evaluated; null = indicator disarmed */
   currentArmed: ArmedSetup | null | undefined;
+  /** Active pre-arm candidate on the closed bars (used when order is a Pre-Arm limit). */
+  currentPreArmed?: PreArmedSetup | null;
 }): LimitEvaluation {
   const { order } = opts;
 
@@ -172,7 +180,17 @@ export function evaluatePendingLimit(opts: {
   }
 
   if (opts.currentArmed !== undefined) {
-    if (!opts.currentArmed || opts.currentArmed.side !== order.side) {
+    const preArmOrder = isPreArmReason(order.reason);
+    const armedMatches = Boolean(opts.currentArmed && opts.currentArmed.side === order.side);
+    const preArmMatches =
+      preArmOrder &&
+      Boolean(
+        opts.currentPreArmed &&
+          opts.currentPreArmed.side === order.side &&
+          preArmMatchesOrder(order.entry, opts.currentPreArmed),
+      );
+    const stillValid = preArmOrder ? armedMatches || preArmMatches : armedMatches;
+    if (!stillValid) {
       const reason: LimitCancelReason =
         barsElapsed >= Math.max(1, order.ftcWait) ? "queue expired" : "pattern failed";
       return { action: "cancel", cancelReason: reason, barsElapsed };
