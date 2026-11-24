@@ -32,6 +32,7 @@ import {
 } from "./desk.server";
 import { lockOperator, lockStatus, requireOperator, setOperatorPin, unlockOperator } from "./lock.server";
 import { bookVenue, getAdapter, venueSymbol } from "@/lib/exchanges/registry";
+import { normalizeLeverageRange } from "@/lib/exchanges/lev-cap";
 import { stringifyLevSizeTiers } from "@/lib/engine/lev-size";
 import { isTelegramChatId, isTelegramToken, parseTelegramVenues, stringifyTelegramVenues } from "@/lib/telegram";
 import { accountFrom, clearUniverseCache, hasLiveKeys, overlayLiveSnapshot, refreshUniverse, runTick } from "./tick.server";
@@ -153,6 +154,7 @@ export const saveDeskSettings = createServerFn({ method: "POST" })
       venue: z.enum(["paper", "hyperliquid", "lighter", "aster", "ourbit"]).optional(),
       risk_pct: z.number().min(0.1).max(5).optional(),
       capital_pct: z.number().min(1).max(100).optional(),
+      min_leverage: z.number().int().min(1).max(200).optional(),
       max_leverage: z.number().int().min(1).max(200).optional(),
       stack_lev_count: z.number().int().min(0).max(20).optional(),
       stack_lev_cap: z.number().int().min(1).max(200).optional(),
@@ -211,6 +213,14 @@ export const saveDeskSettings = createServerFn({ method: "POST" })
     } = { ...rest };
     if (lev_size_tiers !== undefined) {
       patch.lev_size_tiers = stringifyLevSizeTiers(lev_size_tiers);
+    }
+    if (patch.min_leverage !== undefined || patch.max_leverage !== undefined) {
+      const norm = normalizeLeverageRange(
+        patch.min_leverage ?? before.min_leverage ?? 1,
+        patch.max_leverage ?? before.max_leverage ?? 200,
+      );
+      patch.min_leverage = norm.min;
+      patch.max_leverage = norm.max;
     }
     if (telegram_bot_token != null && telegram_bot_token.trim()) {
       if (!isTelegramToken(telegram_bot_token)) {

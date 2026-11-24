@@ -36,6 +36,7 @@ function Home() {
   const [batch, setBatch] = useState(String(s.scanBatch ?? 0));
   const [maxPos, setMaxPos] = useState(String(s.maxPositions ?? 4));
   const [htfMaxPos, setHtfMaxPos] = useState(String(s.htfMaxPositions ?? 4));
+  const [minLev, setMinLev] = useState(String(s.minLeverage ?? 1));
   const [maxLev, setMaxLev] = useState(String(s.maxLeverage ?? 200));
   const [stackCount, setStackCount] = useState(String(s.stackLevCount ?? 2));
   const [stackCap, setStackCap] = useState(String(s.stackLevCap ?? 75));
@@ -57,6 +58,7 @@ function Home() {
     setBatch(String(s.scanBatch ?? 0));
     setMaxPos(String(s.maxPositions ?? 4));
     setHtfMaxPos(String(s.htfMaxPositions ?? 4));
+    setMinLev(String(s.minLeverage ?? 1));
     setMaxLev(String(s.maxLeverage ?? 200));
     setStackCount(String(s.stackLevCount ?? 2));
     setStackCap(String(s.stackLevCap ?? 75));
@@ -67,7 +69,7 @@ function Home() {
     setLimitTtlBars(String(s.limitTtlBars ?? 0));
     setMaxLimitQueue(String(s.maxLimitQueue ?? 8));
     setAutoTrimExcess(s.autoTrimExcess ?? false);
-  }, [s.capitalPct, s.capitalBase, s.scanBatch, s.maxPositions, s.htfMaxPositions, s.maxLeverage, s.stackLevCount, s.stackLevCap, s.levSizeTiers, s.minMarketCapUsd, s.entryMode, s.safeLimitMode, s.limitTtlBars, s.maxLimitQueue, s.autoTrimExcess]);
+  }, [s.capitalPct, s.capitalBase, s.scanBatch, s.maxPositions, s.htfMaxPositions, s.minLeverage, s.maxLeverage, s.stackLevCount, s.stackLevCap, s.levSizeTiers, s.minMarketCapUsd, s.entryMode, s.safeLimitMode, s.limitTtlBars, s.maxLimitQueue, s.autoTrimExcess]);
   const pnl = Number(data.stats.pnl);
   const curve = data.equity.map((e) => ({
     t: new Date(e.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
@@ -80,6 +82,8 @@ function Home() {
     setSavedOk(false);
     setErrMsg(null);
     try {
+      const maxLevNum = Math.min(200, Math.max(1, Math.round(Number(maxLev) || 200)));
+      const minLevNum = Math.min(maxLevNum, Math.max(1, Math.round(Number(minLev) || 1)));
       const saved = await saveDeskSettings({
         data: {
           capital_pct: Math.min(100, Math.max(1, Number(capital) || DEFAULT_CAPITAL_PCT)),
@@ -87,7 +91,8 @@ function Home() {
           scan_batch: Math.min(250, Math.max(0, Math.round(Number(batch) || 0))),
           max_positions: Math.min(20, Math.max(1, Math.round(Number(maxPos) || 4))),
           htf_max_positions: Math.min(20, Math.max(0, Math.round(Number(htfMaxPos) || 0))),
-          max_leverage: Math.min(200, Math.max(1, Math.round(Number(maxLev) || 200))),
+          min_leverage: minLevNum,
+          max_leverage: maxLevNum,
           stack_lev_count: Math.min(20, Math.max(0, Math.round(Number(stackCount) || 0))),
           stack_lev_cap: Math.min(200, Math.max(1, Math.round(Number(stackCap) || 75))),
           lev_size_tiers: tiers,
@@ -104,7 +109,8 @@ function Home() {
       setBatch(String(saved.scanBatch ?? batch));
       setMaxPos(String(saved.maxPositions ?? maxPos));
       setHtfMaxPos(String(saved.htfMaxPositions ?? htfMaxPos));
-      setMaxLev(String(saved.maxLeverage ?? maxLev));
+      setMinLev(String(saved.minLeverage ?? minLevNum));
+      setMaxLev(String(saved.maxLeverage ?? maxLevNum));
       setStackCount(String(saved.stackLevCount ?? stackCount));
       setStackCap(String(saved.stackLevCap ?? stackCap));
       setTiers(saved.levSizeTiers ?? tiers);
@@ -409,42 +415,86 @@ function Home() {
             </div>
             <span className="text-xs text-subtle">
               {locale === "fa"
-                ? `سقف اهرم ${s.maxLeverage ?? 200}x${Number(s.stackLevCount) > 0 ? ` · بعد از ${s.stackLevCount} معاملهٔ >${s.stackLevCap}x می‌شود ${s.stackLevCap}x` : ""}`
-                : `Leverage cap ${s.maxLeverage ?? 200}x${Number(s.stackLevCount) > 0 ? ` · after ${s.stackLevCount} opens >${s.stackLevCap}x → ${s.stackLevCap}x` : ""}`}
+                ? `${(s.minLeverage ?? 1) > 1 ? `محدوده اهرم ${s.minLeverage}x تا ${s.maxLeverage ?? 200}x` : `سقف اهرم ${s.maxLeverage ?? 200}x`}${Number(s.stackLevCount) > 0 ? ` · بعد از ${s.stackLevCount} معاملهٔ >${s.stackLevCap}x می‌شود ${s.stackLevCap}x` : ""}`
+                : `${(s.minLeverage ?? 1) > 1 ? `Leverage range ${s.minLeverage}x–${s.maxLeverage ?? 200}x` : `Leverage cap ${s.maxLeverage ?? 200}x`}${Number(s.stackLevCount) > 0 ? ` · after ${s.stackLevCount} opens >${s.stackLevCap}x → ${s.stackLevCap}x` : ""}`}
             </span>
           </div>
-          <div className="mb-4 grid gap-1.5 rounded-lg border border-accent/50 bg-surface-2 p-3">
-            <Label htmlFor="desk-maxlev">{t.autoLev}</Label>
-            <Input
-              id="desk-maxlev"
-              type="number"
-              min={1}
-              max={200}
-              step={1}
-              value={maxLev}
-              disabled={!unlocked || saving}
-              onChange={(e) => setMaxLev(e.target.value)}
-            />
-            <div className="flex flex-wrap gap-1">
-              {[5, 10, 20, 25, 50, 100, 200].map((n) => (
-                <button
-                  key={n}
-                  type="button"
+          <div className="mb-4 grid gap-3 rounded-lg border border-accent/50 bg-surface-2 p-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="grid gap-1.5">
+                <Label htmlFor="desk-minlev">{t.minLev}</Label>
+                <Input
+                  id="desk-minlev"
+                  type="number"
+                  min={1}
+                  max={200}
+                  step={1}
+                  value={minLev}
                   disabled={!unlocked || saving}
-                  onClick={() => setMaxLev(String(n))}
-                  className={`min-h-8 rounded-sm border px-2 text-xs ${
-                    Number(maxLev) === n
-                      ? "border-accent bg-surface text-fg"
-                      : "border-border text-muted hover:border-border-strong"
-                  } disabled:opacity-40`}
-                >
-                  {n}x
-                </button>
-              ))}
+                  onChange={(e) => setMinLev(e.target.value)}
+                />
+                <div className="flex flex-wrap gap-1">
+                  {[
+                    { n: 1, label: locale === "fa" ? "بدون کف (1x)" : "Any (1x)" },
+                    { n: 25, label: "25x" },
+                    { n: 50, label: "50x" },
+                    { n: 75, label: "75x" },
+                    { n: 100, label: "100x" },
+                    { n: 125, label: "125x" },
+                    { n: 150, label: "150x" },
+                  ].map((p) => (
+                    <button
+                      key={p.n}
+                      type="button"
+                      disabled={!unlocked || saving}
+                      onClick={() => setMinLev(String(p.n))}
+                      className={`min-h-8 rounded-sm border px-2 text-xs ${
+                        Math.max(1, Math.round(Number(minLev) || 1)) === p.n
+                          ? "border-accent bg-surface text-fg"
+                          : "border-border text-muted hover:border-border-strong"
+                      } disabled:opacity-40`}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="grid gap-1.5">
+                <Label htmlFor="desk-maxlev">{t.autoLev}</Label>
+                <Input
+                  id="desk-maxlev"
+                  type="number"
+                  min={1}
+                  max={200}
+                  step={1}
+                  value={maxLev}
+                  disabled={!unlocked || saving}
+                  onChange={(e) => setMaxLev(e.target.value)}
+                />
+                <div className="flex flex-wrap gap-1">
+                  {[5, 10, 20, 25, 50, 100, 125, 200].map((n) => (
+                    <button
+                      key={n}
+                      type="button"
+                      disabled={!unlocked || saving}
+                      onClick={() => setMaxLev(String(n))}
+                      className={`min-h-8 rounded-sm border px-2 text-xs ${
+                        Number(maxLev) === n
+                          ? "border-accent bg-surface text-fg"
+                          : "border-border text-muted hover:border-border-strong"
+                      } disabled:opacity-40`}
+                    >
+                      {n}x
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
             <p className="text-xs text-subtle">
               {(() => {
                 const userCap = Math.min(200, Math.max(1, Math.round(Number(maxLev) || 200)));
+                const userMin = Math.min(userCap, Math.max(1, Math.round(Number(minLev) || 1)));
+                const inRangeCount = data.universe.filter((a) => Math.round(Number(a.max_leverage) || 0) >= userMin).length;
                 const btc = data.universe.find((a) => a.base === "BTC") ?? data.universe[0];
                 const venueLev = Number(btc?.max_leverage) || 25;
                 const lev = Math.min(userCap, venueLev);
@@ -453,8 +503,8 @@ function Home() {
                 const notional = pile * (capN / 100) * lev;
                 const coin = btc?.base ?? "BTC";
                 return locale === "fa"
-                  ? `۱ تا ۲۰۰. ربات از سقف خود ارز بالاتر نمی‌رود. الان: ${capN}٪ مارجین × ${lev}x روی ${coin} ≈ ${fmtUsd(notional, 0)} حجم · سقف ارز ${venueLev}x`
-                  : `1–200. Never above that coin's venue max. Now: ${capN}% margin × ${lev}x on ${coin} ≈ ${fmtUsd(notional, 0)} notional · venue max ${venueLev}x`;
+                  ? `محدوده ${userMin}x تا ${userCap}x${userMin > 1 ? ` (${inRangeCount} ارز مجاز با سقف ≥${userMin}x)` : ""}. ربات از سقف خود ارز بالاتر نمی‌رود. الان: ${capN}٪ مارجین × ${lev}x روی ${coin} ≈ ${fmtUsd(notional, 0)} حجم · سقف ارز ${venueLev}x`
+                  : `Range ${userMin}x–${userCap}x${userMin > 1 ? ` (${inRangeCount} coins qualify at ≥${userMin}x)` : ""}. Never above that coin's venue max. Now: ${capN}% margin × ${lev}x on ${coin} ≈ ${fmtUsd(notional, 0)} notional · venue max ${venueLev}x`;
               })()}
             </p>
             <div className="mt-2 grid grid-cols-2 gap-2 border-t border-border/60 pt-3">

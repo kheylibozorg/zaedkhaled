@@ -45,7 +45,8 @@ export const copy = {
     capitalBaseHint:
       "از کل: همیشه همان درصد از کل حساب؛ اگر آزاد کمتر بود همان آزاد می‌رود. از آزاد: درصد از پولی که الان درگیر نیست.",
     scanBatch: "ارز در هر تیک",
-    autoLev: "حداکثر اهرم (قابل تنظیم)",
+    minLev: "حداقل اهرم (از)",
+    autoLev: "حداکثر اهرم (تا)",
     stackLev: "سقف اهرم با چند معاملهٔ همزمان",
     stackLevCount: "تعداد معامله",
     stackLevCap: "سقف بعدی",
@@ -154,7 +155,7 @@ export const copy = {
     thOut: "خروج",
     thSide: "سمت",
     enginesHint:
-      "هر موتور را در هر تایم‌فریم جدا خاموش یا روشن کن. لانگ و شورت هر موتور هم جدا قطع می‌شود. خاموش یعنی آن ترکیب دیگر سیگنال نمی‌دهد. منطق خود اندیکاتور عوض نمی‌شود و پوزیشن باز همان‌طور مدیریت می‌شود.",
+      "هر موتور را در هر تایم‌فریم جدا خاموش یا روشن کن. لانگ و شورت هم هم به‌صورت کلی برای کل موتور و هم جداگانه در هر تایم‌فریم قابل قطع است. خاموش یعنی آن ترکیب دیگر سیگنال نمی‌دهد. منطق خود اندیکاتور عوض نمی‌شود و پوزیشن باز همان‌طور مدیریت می‌شود.",
     enginesAllOn: "همه روشن",
     enginesAllOff: "همه خاموش",
     enginesOn: "روشن",
@@ -240,7 +241,8 @@ export const copy = {
     capitalBaseHint:
       "Total: always that % of the whole account; if free is smaller, free is used. Free: % of cash not already in a trade.",
     scanBatch: "Coins per tick",
-    autoLev: "Max leverage (you set this)",
+    minLev: "Min leverage (from)",
+    autoLev: "Max leverage (to)",
     stackLev: "Stack cap (high-leverage concurrent)",
     stackLevCount: "Concurrent trades",
     stackLevCap: "Then cap at",
@@ -349,7 +351,7 @@ export const copy = {
     thOut: "Out",
     thSide: "Side",
     enginesHint:
-      "Mute any engine on any timeframe. Long and short can be cut per engine, or for every engine at once. Off means that pair no longer fires. Indicator math stays locked. Open positions are still managed.",
+      "Mute any engine on any timeframe. Long and short can be cut per engine globally or individually inside each timeframe. Off means that combination no longer opens trades. Indicator math stays locked. Open positions are still managed.",
     enginesAllOn: "All on",
     enginesAllOff: "All off",
     enginesOn: "On",

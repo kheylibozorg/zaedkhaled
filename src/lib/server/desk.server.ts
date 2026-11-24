@@ -16,6 +16,7 @@ export type SettingsRow = {
   venue: string;
   risk_pct: number;
   capital_pct: number;
+  min_leverage?: number | null;
   max_leverage?: number | null;
   stack_lev_count?: number | null;
   stack_lev_cap?: number | null;
@@ -111,6 +112,10 @@ export function publicSettings(row: SettingsRow, opts?: { unlocked?: boolean }) 
     venue: bookVenue(row.venue) as "paper" | "hyperliquid" | "lighter" | "aster" | "ourbit",
     riskPct: num(row.risk_pct, 1),
     capitalPct: num(row.capital_pct, DEFAULT_CAPITAL_PCT),
+    minLeverage: Math.min(
+      Math.min(200, Math.max(1, Math.round(num(row.max_leverage, 200)))),
+      Math.max(1, Math.round(num(row.min_leverage, 1))),
+    ),
     maxLeverage: Math.min(200, Math.max(1, Math.round(num(row.max_leverage, 200)))),
     stackLevCount: Math.min(20, Math.max(0, Math.round(num(row.stack_lev_count, 2)))),
     stackLevCap: Math.min(200, Math.max(1, Math.round(num(row.stack_lev_cap, 75)))),
@@ -221,6 +226,7 @@ async function ensureTickHardeningColumns(sql: Awaited<ReturnType<typeof getSql>
     "alter table desk_settings add column if not exists limit_ttl_bars integer not null default 0",
     "alter table desk_settings add column if not exists max_limit_queue integer not null default 8",
     "alter table desk_settings add column if not exists auto_trim_excess integer not null default 0",
+    "alter table desk_settings add column if not exists min_leverage integer not null default 1",
     "create table if not exists limit_orders (id serial primary key, mode text not null default 'paper', venue text not null default 'paper', symbol text not null, timeframe text not null, indicator text not null, side text not null, entry double precision not null, sl double precision not null, tp double precision not null, rr double precision not null, atr double precision, be_at_r double precision, qty double precision not null, leverage integer not null default 1, notional_usd double precision not null default 0, risk_usd double precision not null default 0, margin_usd double precision not null default 0, armed_bar_time bigint not null, ftc_wait integer not null default 8, max_wait_bars integer not null default 8, reason text, exchange_order_id text, status text not null default 'pending', cancel_reason text, distance_atr double precision, created_at timestamptz not null default now(), updated_at timestamptz not null default now(), closed_at timestamptz)",
     "alter table limit_orders add column if not exists distance_atr double precision",
     "create unique index if not exists limit_orders_dedupe_idx on limit_orders (symbol, timeframe, indicator, armed_bar_time)",
@@ -265,7 +271,7 @@ export async function getSettings(): Promise<SettingsRow> {
     }
   }
   await ensureTickHardeningColumns(sql);
-  if (!("telegram_venues" in row) || !("entry_mode" in row) || !("max_limit_queue" in row) || !("auto_trim_excess" in row)) {
+  if (!("telegram_venues" in row) || !("entry_mode" in row) || !("max_limit_queue" in row) || !("auto_trim_excess" in row) || !("min_leverage" in row)) {
     const again = await sql<SettingsRow>`select * from desk_settings where id = 1`;
     if (again[0]) row = again[0];
   }
@@ -302,6 +308,7 @@ export type SettingsPatch = Partial<{
   venue: string;
   risk_pct: number;
   capital_pct: number;
+  min_leverage: number;
   max_leverage: number;
   stack_lev_count: number;
   stack_lev_cap: number;
@@ -345,6 +352,7 @@ export async function patchSettings(patch: SettingsPatch) {
     "venue",
     "risk_pct",
     "capital_pct",
+    "min_leverage",
     "max_leverage",
     "stack_lev_count",
     "stack_lev_cap",

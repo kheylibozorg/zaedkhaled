@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  clearTfSideForSide,
   countArmed,
   countSidesArmed,
   isEngineOn,
   isSideOn,
   parseEngineGates,
   parseSideGates,
+  parseTfSideGates,
   scanNames,
   serializeEngineGates,
   setAllEngines,
@@ -15,6 +17,7 @@ import {
   setEngineGate,
   setEngineRow,
   setSideGate,
+  setTfSideGate,
 } from "./engine-gates.ts";
 import { SCAN_RULE } from "./types.ts";
 
@@ -107,5 +110,48 @@ describe("engine gates", () => {
     assert.equal(isSideOn(junk, "APEX1", "long"), false);
     assert.equal(isSideOn(junk, "APEX1", "short"), true);
     assert.equal(isSideOn(junk, "NOPE", "long"), true);
+  });
+
+  it("mutes a single timeframe side for one engine without muting other timeframes or the other side", () => {
+    const tfSides = setTfSideGate({}, "APEX1", "15m", "short", false);
+    assert.equal(isSideOn({}, "APEX1", "short", "15m", tfSides), false);
+    assert.equal(isSideOn({}, "APEX1", "long", "15m", tfSides), true);
+    assert.equal(isSideOn({}, "APEX1", "short", "5m", tfSides), true);
+    assert.equal(isSideOn({}, "APEX1", "short", "1h", tfSides), true);
+    assert.equal(isSideOn({}, "APEX2", "short", "15m", tfSides), true);
+
+    const engineSides = setSideGate({}, "APEX2", "long", false);
+    assert.equal(isSideOn(engineSides, "APEX2", "long", "15m", tfSides), false);
+    assert.equal(isSideOn(engineSides, "APEX2", "short", "15m", tfSides), true);
+
+    const cleared = clearTfSideForSide(tfSides, "short", "APEX1");
+    assert.equal(isSideOn({}, "APEX1", "short", "15m", cleared), true);
+  });
+
+  it("round-trips per-timeframe sides in compact JSON and ignores invalid entries", () => {
+    const gates = setEngineGate({}, "TREX1", "4h", false);
+    const sides = setSideGate({}, "HALC", "long", false);
+    const tfSides = setTfSideGate(setTfSideGate({}, "APEX1", "15m", "short", false), "KETEX", "1h", "long", false);
+    const raw = serializeEngineGates(gates, sides, tfSides);
+    assert.equal(raw.includes("true"), false);
+
+    const parsedGates = parseEngineGates(raw);
+    const parsedSides = parseSideGates(raw);
+    const parsedTfSides = parseTfSideGates(raw);
+
+    assert.equal(isEngineOn(parsedGates, "TREX1", "4h"), false);
+    assert.equal(isEngineOn(parsedGates, "APEX1", "15m"), true);
+    assert.equal(isSideOn(parsedSides, "HALC", "long", "15m", parsedTfSides), false);
+    assert.equal(isSideOn(parsedSides, "APEX1", "short", "15m", parsedTfSides), false);
+    assert.equal(isSideOn(parsedSides, "APEX1", "long", "15m", parsedTfSides), true);
+    assert.equal(isSideOn(parsedSides, "APEX1", "short", "5m", parsedTfSides), true);
+    assert.equal(isSideOn(parsedSides, "KETEX", "long", "1h", parsedTfSides), false);
+
+    const junk = parseTfSideGates(
+      '{"_tfSides":{"NOPE":{"15m":{"short":false}},"APEX1":{"9m":{"short":false},"15m":{"short":false,"long":"bad"}}}}',
+    );
+    assert.equal(isSideOn({}, "APEX1", "short", "15m", junk), false);
+    assert.equal(isSideOn({}, "APEX1", "long", "15m", junk), true);
+    assert.equal(isSideOn({}, "NOPE", "short", "15m", junk), true);
   });
 });

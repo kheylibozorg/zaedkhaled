@@ -7,12 +7,14 @@ import { Button } from "@/components/ui/button";
 import {
   ENGINE_FAMILIES,
   ENGINE_TFS,
+  clearTfSideForSide,
   countArmed,
   countSidesArmed,
   isEngineOn,
   isSideOn,
   parseEngineGates,
   parseSideGates,
+  parseTfSideGates,
   serializeEngineGates,
   setAllEngines,
   setAllSides,
@@ -20,8 +22,10 @@ import {
   setEngineGate,
   setEngineRow,
   setSideGate,
+  setTfSideGate,
   type EngineGates,
   type SideGates,
+  type TfSideGates,
 } from "@/lib/engine/engine-gates";
 import { indicatorLabel, type IndicatorName, type Side, type Timeframe } from "@/lib/engine/types";
 import { getDesk, saveDeskSettings } from "@/lib/server/functions";
@@ -42,8 +46,10 @@ function Page() {
   const raw = data.settings.engineGates;
   const storedGates = useMemo(() => parseEngineGates(raw), [raw]);
   const storedSides = useMemo(() => parseSideGates(raw), [raw]);
+  const storedTfSides = useMemo(() => parseTfSideGates(raw), [raw]);
   const [gates, setGates] = useState<EngineGates>(storedGates);
   const [sides, setSides] = useState<SideGates>(storedSides);
+  const [tfSides, setTfSides] = useState<TfSideGates>(storedTfSides);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -51,11 +57,13 @@ function Page() {
   useEffect(() => {
     setGates(storedGates);
     setSides(storedSides);
-  }, [storedGates, storedSides]);
+    setTfSides(storedTfSides);
+  }, [storedGates, storedSides, storedTfSides]);
 
   const armed = countArmed(gates);
   const sideArmed = countSidesArmed(sides);
-  const dirty = serializeEngineGates(gates, sides) !== serializeEngineGates(storedGates, storedSides);
+  const dirty =
+    serializeEngineGates(gates, sides, tfSides) !== serializeEngineGates(storedGates, storedSides, storedTfSides);
 
   async function save() {
     if (!unlocked) return;
@@ -63,7 +71,7 @@ function Page() {
     setMsg(null);
     setErr(null);
     try {
-      await saveDeskSettings({ data: { engine_gates: serializeEngineGates(gates, sides) } });
+      await saveDeskSettings({ data: { engine_gates: serializeEngineGates(gates, sides, tfSides) } });
       setMsg(t.enginesSaved);
       await router.invalidate({ sync: true });
     } catch (e) {
@@ -80,7 +88,30 @@ function Page() {
 
   function flipSide(name: IndicatorName, side: Side) {
     if (!unlocked) return;
-    setSides((s) => setSideGate(s, name, side, !isSideOn(s, name, side)));
+    const nextOn = !isSideOn(sides, name, side);
+    setSides((s) => setSideGate(s, name, side, nextOn));
+    if (nextOn) {
+      setTfSides((tfs) => clearTfSideForSide(tfs, side, name));
+    }
+  }
+
+  function flipTfSide(name: IndicatorName, tf: Timeframe, side: Side) {
+    if (!unlocked) return;
+    const rowSideOn = isSideOn(sides, name, side);
+    if (!rowSideOn) {
+      // Turning on one TF side while engine-wide side is off: enable engine-wide side and mute the other TFs.
+      setSides((s) => setSideGate(s, name, side, true));
+      setTfSides((tfs) => {
+        let next = tfs;
+        for (const otherTf of ENGINE_TFS) {
+          next = setTfSideGate(next, name, otherTf, side, otherTf === tf);
+        }
+        return next;
+      });
+      return;
+    }
+    const currentlyOn = isSideOn(sides, name, side, tf, tfSides);
+    setTfSides((tfs) => setTfSideGate(tfs, name, tf, side, !currentlyOn));
   }
 
   function rowOn(name: IndicatorName, on: boolean) {
@@ -101,6 +132,9 @@ function Page() {
   function allSide(side: Side, on: boolean) {
     if (!unlocked) return;
     setSides((s) => setAllSides(s, side, on));
+    if (on) {
+      setTfSides((tfs) => clearTfSideForSide(tfs, side));
+    }
   }
 
   const longAllOn = sideArmed.longOn === sideArmed.total;
@@ -154,7 +188,7 @@ function Page() {
       {err ? <p className="mt-3 text-sm text-short">{err}</p> : null}
 
       <div className="mt-6 overflow-x-auto rounded-lg border border-border bg-surface shadow-panel">
-        <table className="w-full min-w-[760px] text-sm">
+        <table className="w-full min-w-[880px] text-sm">
           <thead className="text-xs text-subtle">
             <tr className="border-b border-border">
               <th className="px-3 py-2 text-start font-medium">{t.thInd}</th>
@@ -213,14 +247,18 @@ function Page() {
                 family={family}
                 gates={gates}
                 sides={sides}
+                tfSides={tfSides}
                 unlocked={unlocked}
                 fa={fa}
                 rowOn={t.enginesOn}
                 rowOff={t.enginesOff}
+                longLabel={t.long}
+                shortLabel={t.short}
                 rowLabel={t.enginesRow}
                 familyLabel={t.enginesFamily}
                 onFlip={flip}
                 onFlipSide={flipSide}
+                onFlipTfSide={flipTfSide}
                 onRow={rowOn}
                 onFamily={familyOn}
               />
@@ -236,28 +274,36 @@ function FamilyBlock({
   family,
   gates,
   sides,
+  tfSides,
   unlocked,
   fa,
   rowOn,
   rowOff,
+  longLabel,
+  shortLabel,
   rowLabel,
   familyLabel,
   onFlip,
   onFlipSide,
+  onFlipTfSide,
   onRow,
   onFamily,
 }: {
   family: (typeof ENGINE_FAMILIES)[number];
   gates: EngineGates;
   sides: SideGates;
+  tfSides: TfSideGates;
   unlocked: boolean;
   fa: boolean;
   rowOn: string;
   rowOff: string;
+  longLabel: string;
+  shortLabel: string;
   rowLabel: string;
   familyLabel: string;
   onFlip: (name: IndicatorName, tf: Timeframe) => void;
   onFlipSide: (name: IndicatorName, side: Side) => void;
+  onFlipTfSide: (name: IndicatorName, tf: Timeframe, side: Side) => void;
   onRow: (name: IndicatorName, on: boolean) => void;
   onFamily: (names: IndicatorName[], on: boolean) => void;
 }) {
@@ -287,34 +333,76 @@ function FamilyBlock({
         </td>
       </tr>
       {family.names.map((name) => {
+        const label = indicatorLabel(name);
         const rowCount = ENGINE_TFS.filter((tf) => isEngineOn(gates, name, tf)).length;
         const longOn = isSideOn(sides, name, "long");
         const shortOn = isSideOn(sides, name, "short");
         return (
           <tr key={name} className="border-t border-border/60">
             <td className="px-3 py-2.5">
-              <div className="font-medium">{indicatorLabel(name)}</div>
+              <div className="font-medium">{label}</div>
               <div className="font-mono text-[10px] text-subtle" dir="ltr">
                 {name}
               </div>
             </td>
             {ENGINE_TFS.map((tf) => {
               const on = isEngineOn(gates, name, tf);
+              const tfLongOn = isSideOn(sides, name, "long", tf, tfSides);
+              const tfShortOn = isSideOn(sides, name, "short", tf, tfSides);
               return (
                 <td key={tf} className="px-2 py-2 text-center">
-                  <button
-                    type="button"
-                    disabled={!unlocked}
-                    onClick={() => onFlip(name, tf)}
-                    className={cn(
-                      "inline-flex h-11 min-w-16 items-center justify-center rounded-sm border px-3 text-xs font-medium transition-colors disabled:opacity-40",
-                      on
-                        ? "border-long/40 bg-long-dim text-long"
-                        : "border-border bg-surface-2 text-muted",
-                    )}
-                  >
-                    {on ? rowOn : rowOff}
-                  </button>
+                  <div className="mx-auto inline-grid w-24 gap-1">
+                    <button
+                      type="button"
+                      disabled={!unlocked}
+                      aria-label={`${label} ${tf} ${on ? rowOn : rowOff}`}
+                      onClick={() => onFlip(name, tf)}
+                      className={cn(
+                        "inline-flex h-8 w-full items-center justify-center rounded-sm border px-2 text-xs font-medium transition-colors disabled:opacity-40",
+                        on
+                          ? "border-long/40 bg-long-dim text-long"
+                          : "border-border bg-surface-2 text-muted",
+                      )}
+                    >
+                      {on ? rowOn : rowOff}
+                    </button>
+                    <div className="grid grid-cols-2 gap-1">
+                      <button
+                        type="button"
+                        disabled={!unlocked}
+                        aria-label={`${label} ${tf} ${longLabel}`}
+                        aria-pressed={on && tfLongOn}
+                        onClick={() => onFlipTfSide(name, tf, "long")}
+                        className={cn(
+                          "inline-flex h-7 items-center justify-center rounded-sm border px-1.5 text-[11px] font-medium transition-colors disabled:opacity-40",
+                          !on
+                            ? "border-border/70 bg-surface-2 text-muted/60"
+                            : tfLongOn
+                              ? "border-long/40 bg-long-dim text-long"
+                              : "border-border bg-surface-2 text-muted line-through",
+                        )}
+                      >
+                        {longLabel}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={!unlocked}
+                        aria-label={`${label} ${tf} ${shortLabel}`}
+                        aria-pressed={on && tfShortOn}
+                        onClick={() => onFlipTfSide(name, tf, "short")}
+                        className={cn(
+                          "inline-flex h-7 items-center justify-center rounded-sm border px-1.5 text-[11px] font-medium transition-colors disabled:opacity-40",
+                          !on
+                            ? "border-border/70 bg-surface-2 text-muted/60"
+                            : tfShortOn
+                              ? "border-short/40 bg-short-dim text-short"
+                              : "border-border bg-surface-2 text-muted line-through",
+                        )}
+                      >
+                        {shortLabel}
+                      </button>
+                    </div>
+                  </div>
                 </td>
               );
             })}
@@ -322,6 +410,7 @@ function FamilyBlock({
               <button
                 type="button"
                 disabled={!unlocked}
+                aria-label={`${label} ${longLabel}`}
                 onClick={() => onFlipSide(name, "long")}
                 className={cn(
                   "inline-flex h-11 min-w-16 items-center justify-center rounded-sm border px-3 text-xs font-medium transition-colors disabled:opacity-40",
@@ -335,6 +424,7 @@ function FamilyBlock({
               <button
                 type="button"
                 disabled={!unlocked}
+                aria-label={`${label} ${shortLabel}`}
                 onClick={() => onFlipSide(name, "short")}
                 className={cn(
                   "inline-flex h-11 min-w-16 items-center justify-center rounded-sm border px-3 text-xs font-medium transition-colors disabled:opacity-40",

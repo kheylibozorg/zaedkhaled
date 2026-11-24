@@ -2,7 +2,7 @@ import { fetchKlinesCached } from "@/lib/market/klines";
 import { FALLBACK_UNIVERSE, fetchUniverse, fetchVenueUniverse, filterByMinCap, minCapUsd, looksLikeFallbackUniverse } from "@/lib/market/universe";
 import { fetchVenueLastPrice } from "@/lib/market/venues";
 import { onlyClosedBars, runIndicator, scanArmedClosed, scanBarClosed, type ArmedSetup } from "@/lib/engine/run";
-import { parseEngineGates, parseSideGates, scanNames, isEngineOn, isSideOn } from "@/lib/engine/engine-gates";
+import { parseEngineGates, parseSideGates, parseTfSideGates, scanNames, isEngineOn, isSideOn } from "@/lib/engine/engine-gates";
 import {
   PAPER_MAKER_BPS,
   PAPER_MIN_NOTIONAL_USD,
@@ -77,7 +77,7 @@ import {
 } from "@/lib/engine/scan-schedule";
 import { bookVenue, chartHostLabel, getAdapter, resolveMaxLeverage, sameCoin, venueSymbol } from "@/lib/exchanges/registry";
 import { venueMaxLeverage, loadPublicLeverageMaps } from "@/lib/exchanges/leverage";
-import { capLeverage, stackedUserLevCap } from "@/lib/exchanges/lev-cap";
+import { capLeverage, isCoinWithinLeverageRange, normalizeLeverageRange, stackedUserLevCap } from "@/lib/exchanges/lev-cap";
 import type { ExchangeAccount, ExchangeAdapter, PlaceOrderResult, ProtectionSnapshot, VenueOpenOrder } from "@/lib/exchanges/types";
 import { readVenueWallet, usedMarginUsd, attachAvailable } from "@/lib/exchanges/wallet";
 import {
@@ -1065,6 +1065,21 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   const openLevs = stillOpen.map((p) => Number(p.leverage) || 0);
   const engineGates = parseEngineGates(settings.engine_gates);
   const sideGates = parseSideGates(settings.engine_gates);
+  const tfSideGates = parseTfSideGates(settings.engine_gates);
+  const levRange = normalizeLeverageRange(settings.min_leverage, settings.max_leverage);
+  const userLevCap = levRange.max;
+  const minLev = levRange.min;
+  const levMemo = new Map<string, number>();
+
+  async function coinMaxLev(sym: string) {
+    let n = levMemo.get(sym);
+    if (!n) {
+      n = capLeverage(await resolveMaxLeverage(venue, venue === "paper" ? sym : venueSymbol(venue, sym), acc));
+      levMemo.set(sym, n);
+    }
+    return n;
+  }
+
   const pendingTelegram: TelegramSignal[] = [];
 
   type FoundArmed = ArmedSetup & {
@@ -1364,9 +1379,11 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             currentPreArmed = undefined;
           }
         }
+        const orderCoinMax = minLev > 1 ? await coinMaxLev(o.symbol) : 200;
         const gateMuted =
           !isEngineOn(engineGates, o.indicator as IndicatorName, tf) ||
-          !isSideOn(sideGates, o.indicator, side);
+          !isSideOn(sideGates, o.indicator, side, tf, tfSideGates) ||
+          !isCoinWithinLeverageRange(orderCoinMax, minLev);
         const evalRes = evaluatePendingLimit({
           order: {
             symbol: o.symbol,
@@ -1567,9 +1584,11 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           currentPreArmed = undefined;
         }
       }
+      const watchCoinMax = minLev > 1 ? await coinMaxLev(w.symbol) : 200;
       const gateMuted =
         !isEngineOn(engineGates, w.indicator as IndicatorName, tf) ||
-        !isSideOn(sideGates, w.indicator, side);
+        !isSideOn(sideGates, w.indicator, side, tf, tfSideGates) ||
+        !isCoinWithinLeverageRange(watchCoinMax, minLev);
       const evalRes = evaluatePendingLimit({
         order: {
           symbol: w.symbol,
@@ -1666,7 +1685,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           phase: c.phase === "pre-arm" ? ("pre-arm" as const) : ("armed" as const),
         })),
       );
-      const levCapB = Math.min(200, Math.max(1, Math.round(Number(settings.max_leverage) || 200)));
+      const levCapB = userLevCap;
       const rawStackB = Number(settings.stack_lev_count);
       const stackCntB = Number.isFinite(rawStackB) ? Math.max(0, Math.round(rawStackB)) : 2;
       const stackCapB = Math.min(200, Math.max(1, Math.round(Number(settings.stack_lev_cap) || 75)));
@@ -1675,6 +1694,11 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       const tiersB = parseLevSizeTiers(settings.lev_size_tiers);
       for (const cand of rankedWatch) {
         if (shouldStageInWatchQueue({ timeframe: cand.timeframe, phase: cand.phase, distanceAtr: cand.distanceAtr })) {
+          continue;
+        }
+        const coinMax = await coinMaxLev(cand.symbol);
+        if (!isCoinWithinLeverageRange(coinMax, minLev)) {
+          if (cand.existingWatchId) await cancelLimitOrder(cand.existingWatchId, "gate muted").catch(() => undefined);
           continue;
         }
         const gateCheck = canQueueLimitOrder({
@@ -1690,7 +1714,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           pendingCount: pendingCnt,
           htfOpenCount: htfOpen,
           htfPendingCount: htfPendingCnt,
-          sideOn: isSideOn(sideGates, cand.indicator, cand.side),
+          sideOn: isSideOn(sideGates, cand.indicator, cand.side, cand.timeframe, tfSideGates),
           side: cand.side,
           entry: cand.entry,
           sl: cand.sl,
@@ -1700,7 +1724,6 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         if (live && (!liveBalReady || !liveBookReady || liveBlock)) continue;
         const sizingAvail = safeLimitMode ? Math.max(0, available - reservedMarginBetween) : available;
         if (sizingAvail <= 0) continue;
-        const coinMax = capLeverage(await resolveMaxLeverage(venue, venue === "paper" ? cand.symbol : venueSymbol(venue, cand.symbol), acc));
         const lev = Math.min(stackedUserLevCap(levCapB, openLevs, stackCntB, stackCapB), coinMax);
         const capPct = capitalPctForLeverage(coinMax, capPctDefB, tiersB);
         const sized = sizePosition({
@@ -2034,20 +2057,9 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   const capitalPctDefault = Number(settings.capital_pct) || DEFAULT_CAPITAL_PCT;
   const capitalBase = parseCapitalBase(settings.capital_base);
   const levSizeTiers = parseLevSizeTiers(settings.lev_size_tiers);
-  const userLevCap = Math.min(200, Math.max(1, Math.round(Number(settings.max_leverage) || 200)));
   const rawStackCount = Number(settings.stack_lev_count);
   const stackCount = Number.isFinite(rawStackCount) ? Math.max(0, Math.round(rawStackCount)) : 2;
   const stackCap = Math.min(200, Math.max(1, Math.round(Number(settings.stack_lev_cap) || 75)));
-  const levMemo = new Map<string, number>();
-
-  async function coinMaxLev(sym: string) {
-    let n = levMemo.get(sym);
-    if (!n) {
-      n = capLeverage(await resolveMaxLeverage(venue, venue === "paper" ? sym : venueSymbol(venue, sym), acc));
-      levMemo.set(sym, n);
-    }
-    return n;
-  }
 
   if (entryMode === "limit" && allLimitSetups.length) {
     const activeAfterRecon = await listPendingLimitOrders();
@@ -2149,7 +2161,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
 
     for (const armed of rankedCandidates) {
       const coin = armed.coin;
-      if (!isSideOn(sideGates, armed.indicator, armed.side)) continue;
+      if (!isSideOn(sideGates, armed.indicator, armed.side, armed.timeframe, tfSideGates)) continue;
       if (!isValidLimitGeometry(armed.side, armed.entry, armed.sl, armed.tp)) continue;
       if (held.has(coin) || pendingCoins.has(coin)) continue;
       if (filledBars.has(barFillKey(armed.symbol, armed.timeframe, armed.armedBarTime))) continue;
@@ -2167,6 +2179,10 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       }
 
       const coinMax = await coinMaxLev(armed.symbol);
+      if (!isCoinWithinLeverageRange(coinMax, minLev)) {
+        if (armed.existingWatchId) await cancelLimitOrder(armed.existingWatchId, "gate muted").catch(() => undefined);
+        continue;
+      }
       const lev = Math.min(stackedUserLevCap(userLevCap, openLevs, stackCount, stackCap), coinMax);
       const capitalPct = capitalPctForLeverage(coinMax, capitalPctDefault, levSizeTiers);
 
@@ -2639,7 +2655,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     const stale = !isFreshSignal(s.barTime, s.timeframe, Date.now());
     skip = skipFill({
       stale,
-      sideOn: isSideOn(sideGates, s.indicator, s.side),
+      sideOn: isSideOn(sideGates, s.indicator, s.side, s.timeframe, tfSideGates),
       coin,
       barKey,
       held,
@@ -2680,10 +2696,15 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         }
       }
       const coinMax = await coinMaxLev(s.symbol);
+      if (!isCoinWithinLeverageRange(coinMax, minLev)) {
+        skip = `below min leverage (${coinMax}x < ${minLev}x)`;
+      }
       const lev = Math.min(stackedUserLevCap(userLevCap, openLevs, stackCount, stackCap), coinMax);
       // Bucket on the coin's venue max, not the used (user/stack-capped) leverage.
       const capitalPct = capitalPctForLeverage(coinMax, capitalPctDefault, levSizeTiers);
-      const sized = sizePosition({
+      const sized = skip
+        ? null
+        : sizePosition({
         equity,
         capitalPct,
         entry: s.entry,
@@ -2695,8 +2716,9 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         minNotionalUsd: live ? 0 : PAPER_MIN_NOTIONAL_USD,
         feeBps: PAPER_TAKER_BPS,
       });
-      if (!sized) skip = available <= 0 ? "no free capital" : "size failed";
-      else {
+      if (!sized || skip) {
+        if (!skip) skip = available <= 0 ? "no free capital" : "size failed";
+      } else {
         let orderId: string | undefined;
         let placedLive = false;
         let orphan = false;
