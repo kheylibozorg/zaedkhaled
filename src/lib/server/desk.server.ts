@@ -2,6 +2,7 @@ import { getDbSource, getSql, isServerlessRuntime } from "@/lib/db";
 import { DEMO_JOURNAL } from "@/lib/engine/demo-journal";
 import { DEFAULT_CAPITAL_PCT, parseCapitalBase, parseLevSizeTiers } from "@/lib/engine/lev-size";
 import { clampLimitTtlBars, parseEntryMode } from "@/lib/engine/limit-queue";
+import { clampMaxLimitQueue } from "@/lib/engine/smart-queue";
 import { bookVenue } from "@/lib/exchanges/meta";
 import { parseTelegramVenues } from "@/lib/telegram";
 import { randomBytes } from "node:crypto";
@@ -63,6 +64,8 @@ export type SettingsRow = {
   entry_mode?: string | null;
   safe_limit_mode?: number | null;
   limit_ttl_bars?: number | null;
+  max_limit_queue?: number | null;
+  auto_trim_excess?: number | null;
   updated_at: string;
 };
 
@@ -157,6 +160,8 @@ export function publicSettings(row: SettingsRow, opts?: { unlocked?: boolean }) 
     entryMode: parseEntryMode(row.entry_mode),
     safeLimitMode: row.safe_limit_mode == null ? true : Boolean(num(row.safe_limit_mode, 1)),
     limitTtlBars: clampLimitTtlBars(row.limit_ttl_bars),
+    maxLimitQueue: row.max_limit_queue == null ? 8 : clampMaxLimitQueue(row.max_limit_queue),
+    autoTrimExcess: Boolean(num(row.auto_trim_excess, 0)),
   };
 }
 
@@ -214,9 +219,13 @@ async function ensureTickHardeningColumns(sql: Awaited<ReturnType<typeof getSql>
     "alter table desk_settings add column if not exists entry_mode text not null default 'limit'",
     "alter table desk_settings add column if not exists safe_limit_mode integer not null default 1",
     "alter table desk_settings add column if not exists limit_ttl_bars integer not null default 0",
-    "create table if not exists limit_orders (id serial primary key, mode text not null default 'paper', venue text not null default 'paper', symbol text not null, timeframe text not null, indicator text not null, side text not null, entry double precision not null, sl double precision not null, tp double precision not null, rr double precision not null, atr double precision, be_at_r double precision, qty double precision not null, leverage integer not null default 1, notional_usd double precision not null default 0, risk_usd double precision not null default 0, margin_usd double precision not null default 0, armed_bar_time bigint not null, ftc_wait integer not null default 8, max_wait_bars integer not null default 8, reason text, exchange_order_id text, status text not null default 'pending', cancel_reason text, created_at timestamptz not null default now(), updated_at timestamptz not null default now(), closed_at timestamptz)",
+    "alter table desk_settings add column if not exists max_limit_queue integer not null default 8",
+    "alter table desk_settings add column if not exists auto_trim_excess integer not null default 0",
+    "create table if not exists limit_orders (id serial primary key, mode text not null default 'paper', venue text not null default 'paper', symbol text not null, timeframe text not null, indicator text not null, side text not null, entry double precision not null, sl double precision not null, tp double precision not null, rr double precision not null, atr double precision, be_at_r double precision, qty double precision not null, leverage integer not null default 1, notional_usd double precision not null default 0, risk_usd double precision not null default 0, margin_usd double precision not null default 0, armed_bar_time bigint not null, ftc_wait integer not null default 8, max_wait_bars integer not null default 8, reason text, exchange_order_id text, status text not null default 'pending', cancel_reason text, distance_atr double precision, created_at timestamptz not null default now(), updated_at timestamptz not null default now(), closed_at timestamptz)",
+    "alter table limit_orders add column if not exists distance_atr double precision",
     "create unique index if not exists limit_orders_dedupe_idx on limit_orders (symbol, timeframe, indicator, armed_bar_time)",
     "create index if not exists limit_orders_status_idx on limit_orders (status, created_at desc)",
+    "create index if not exists limit_orders_watch_idx on limit_orders (status, distance_atr asc, updated_at desc)",
     "alter table desk_settings alter column capital_pct set default 3",
     "alter table desk_settings alter column venue set default 'aster'",
   ];
@@ -256,7 +265,7 @@ export async function getSettings(): Promise<SettingsRow> {
     }
   }
   await ensureTickHardeningColumns(sql);
-  if (!("telegram_venues" in row) || !("entry_mode" in row)) {
+  if (!("telegram_venues" in row) || !("entry_mode" in row) || !("max_limit_queue" in row) || !("auto_trim_excess" in row)) {
     const again = await sql<SettingsRow>`select * from desk_settings where id = 1`;
     if (again[0]) row = again[0];
   }
@@ -324,6 +333,8 @@ export type SettingsPatch = Partial<{
   entry_mode: string;
   safe_limit_mode: number;
   limit_ttl_bars: number;
+  max_limit_queue: number;
+  auto_trim_excess: number;
 }>;
 
 export async function patchSettings(patch: SettingsPatch) {
@@ -365,8 +376,10 @@ export async function patchSettings(patch: SettingsPatch) {
     "entry_mode",
     "safe_limit_mode",
     "limit_ttl_bars",
+    "max_limit_queue",
+    "auto_trim_excess",
   ]);
-  const flags = new Set(["live_enabled", "bot_enabled", "paper_24h", "safe_limit_mode"]);
+  const flags = new Set(["live_enabled", "bot_enabled", "paper_24h", "safe_limit_mode", "auto_trim_excess"]);
   const secretKeys = new Set<string>(SECRET_SETTING_KEYS);
   const entries = Object.entries(patch).filter(
     ([k, v]) => v !== undefined && allowed.has(k as keyof SettingsPatch),
@@ -922,6 +935,7 @@ export type LimitOrderRow = {
   exchange_order_id: string | null;
   status: string;
   cancel_reason: string | null;
+  distance_atr?: number | null;
   created_at: string;
   updated_at: string;
   closed_at: string | null;
@@ -932,7 +946,7 @@ export async function listPendingLimitOrders(): Promise<LimitOrderRow[]> {
   await ensureTickHardeningColumns(sql);
   try {
     return await sql<LimitOrderRow>`
-      select * from limit_orders where status = 'pending' order by created_at asc, id asc
+      select * from limit_orders where status = 'pending' order by coalesce(distance_atr, 999) asc, created_at asc, id asc
     `;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -941,12 +955,32 @@ export async function listPendingLimitOrders(): Promise<LimitOrderRow[]> {
   }
 }
 
-export async function listRecentLimitOrders(limit = 40): Promise<LimitOrderRow[]> {
+export async function listWatchLimitOrders(): Promise<LimitOrderRow[]> {
   const sql = await getSql();
   await ensureTickHardeningColumns(sql);
   try {
     return await sql<LimitOrderRow>`
-      select * from limit_orders order by created_at desc, id desc limit ${limit}
+      select * from limit_orders where status = 'watch' order by coalesce(distance_atr, 999) asc, updated_at desc, id asc
+    `;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/limit_orders|does not exist/i.test(msg)) return [];
+    throw err;
+  }
+}
+
+export async function listRecentLimitOrders(limit = 60): Promise<LimitOrderRow[]> {
+  const sql = await getSql();
+  await ensureTickHardeningColumns(sql);
+  try {
+    return await sql<LimitOrderRow>`
+      select * from limit_orders
+      order by
+        case when status = 'pending' then 0 when status = 'watch' then 1 else 2 end asc,
+        case when status in ('pending', 'watch') then coalesce(distance_atr, 999) else 0 end asc,
+        updated_at desc,
+        id desc
+      limit ${limit}
     `;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -985,22 +1019,25 @@ export async function insertLimitOrder(o: {
   maxWaitBars: number;
   reason: string;
   exchangeOrderId?: string | null;
+  distanceAtr?: number | null;
 }): Promise<{ id: number; created: boolean }> {
   const sql = await getSql();
   await ensureTickHardeningColumns(sql);
   try {
+    // Clean any internal bot watch rows for the same symbol so pending supersedes watch cleanly.
+    await sql`delete from limit_orders where symbol = ${o.symbol} and status = 'watch'`;
     const rows = await sql<{ id: number }>`
       insert into limit_orders (
         mode, venue, symbol, timeframe, indicator, side, entry, sl, tp, rr, atr, be_at_r,
         qty, leverage, notional_usd, risk_usd, margin_usd, armed_bar_time, ftc_wait, max_wait_bars,
-        reason, exchange_order_id, status
+        reason, exchange_order_id, distance_atr, status
       )
       values (
         ${o.mode}, ${o.venue}, ${o.symbol}, ${o.timeframe}, ${o.indicator}, ${o.side},
         ${o.entry}, ${o.sl}, ${o.tp}, ${o.rr}, ${o.atr}, ${o.beAtR ?? null},
         ${o.qty}, ${o.leverage}, ${o.notionalUsd}, ${o.riskUsd}, ${o.marginUsd},
         ${o.armedBarTime}, ${o.ftcWait}, ${o.maxWaitBars},
-        ${o.reason}, ${o.exchangeOrderId ?? null}, 'pending'
+        ${o.reason}, ${o.exchangeOrderId ?? null}, ${o.distanceAtr ?? null}, 'pending'
       )
       on conflict (symbol, timeframe, indicator, armed_bar_time) do nothing
       returning id
@@ -1024,6 +1061,166 @@ export async function insertLimitOrder(o: {
   }
 }
 
+export async function upsertWatchLimitOrder(o: {
+  mode: string;
+  venue: string;
+  symbol: string;
+  timeframe: string;
+  indicator: string;
+  side: string;
+  entry: number;
+  sl: number;
+  tp: number;
+  rr: number;
+  atr: number;
+  beAtR?: number | null;
+  qty: number;
+  leverage: number;
+  notionalUsd: number;
+  riskUsd: number;
+  marginUsd: number;
+  armedBarTime: number;
+  ftcWait: number;
+  maxWaitBars: number;
+  reason: string;
+  distanceAtr?: number | null;
+}): Promise<{ id: number; saved: boolean }> {
+  const sql = await getSql();
+  await ensureTickHardeningColumns(sql);
+  try {
+    await sql`
+      delete from limit_orders
+      where symbol = ${o.symbol}
+        and status = 'watch'
+        and (timeframe <> ${o.timeframe} or indicator <> ${o.indicator} or armed_bar_time <> ${o.armedBarTime})
+    `;
+    const rows = await sql<{ id: number }>`
+      insert into limit_orders (
+        mode, venue, symbol, timeframe, indicator, side, entry, sl, tp, rr, atr, be_at_r,
+        qty, leverage, notional_usd, risk_usd, margin_usd, armed_bar_time, ftc_wait, max_wait_bars,
+        reason, distance_atr, status
+      )
+      values (
+        ${o.mode}, ${o.venue}, ${o.symbol}, ${o.timeframe}, ${o.indicator}, ${o.side},
+        ${o.entry}, ${o.sl}, ${o.tp}, ${o.rr}, ${o.atr}, ${o.beAtR ?? null},
+        ${o.qty}, ${o.leverage}, ${o.notionalUsd}, ${o.riskUsd}, ${o.marginUsd},
+        ${o.armedBarTime}, ${o.ftcWait}, ${o.maxWaitBars},
+        ${o.reason}, ${o.distanceAtr ?? null}, 'watch'
+      )
+      on conflict (symbol, timeframe, indicator, armed_bar_time) do update set
+        mode = excluded.mode,
+        venue = excluded.venue,
+        side = excluded.side,
+        entry = excluded.entry,
+        sl = excluded.sl,
+        tp = excluded.tp,
+        rr = excluded.rr,
+        atr = excluded.atr,
+        be_at_r = excluded.be_at_r,
+        qty = excluded.qty,
+        leverage = excluded.leverage,
+        notional_usd = excluded.notional_usd,
+        risk_usd = excluded.risk_usd,
+        margin_usd = excluded.margin_usd,
+        ftc_wait = excluded.ftc_wait,
+        max_wait_bars = excluded.max_wait_bars,
+        reason = excluded.reason,
+        distance_atr = excluded.distance_atr,
+        updated_at = now()
+      where limit_orders.status = 'watch'
+      returning id
+    `;
+    return { id: rows[0]?.id ?? 0, saved: Boolean(rows[0]?.id) };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/duplicate key|unique constraint|limit_orders_dedupe/i.test(msg)) {
+      return { id: 0, saved: false };
+    }
+    throw err;
+  }
+}
+
+export async function promoteWatchLimitOrder(
+  id: number,
+  u: {
+    entry: number;
+    sl: number;
+    tp: number;
+    rr: number;
+    atr: number;
+    qty: number;
+    leverage: number;
+    notionalUsd: number;
+    riskUsd: number;
+    marginUsd: number;
+    maxWaitBars: number;
+    reason: string;
+    distanceAtr?: number | null;
+    exchangeOrderId?: string | null;
+  },
+): Promise<boolean> {
+  const sql = await getSql();
+  const rows = await sql<{ id: number }>`
+    update limit_orders
+    set status = 'pending',
+        entry = ${u.entry},
+        sl = ${u.sl},
+        tp = ${u.tp},
+        rr = ${u.rr},
+        atr = ${u.atr},
+        qty = ${u.qty},
+        leverage = ${u.leverage},
+        notional_usd = ${u.notionalUsd},
+        risk_usd = ${u.riskUsd},
+        margin_usd = ${u.marginUsd},
+        max_wait_bars = ${u.maxWaitBars},
+        reason = ${u.reason},
+        distance_atr = ${u.distanceAtr ?? null},
+        exchange_order_id = ${u.exchangeOrderId ?? null},
+        updated_at = now()
+    where id = ${id} and status = 'watch'
+    returning id
+  `;
+  return Boolean(rows[0]?.id);
+}
+
+export async function demoteLimitOrderToWatch(id: number, distanceAtr?: number | null): Promise<boolean> {
+  const sql = await getSql();
+  const rows = await sql<{ id: number }>`
+    update limit_orders
+    set status = 'watch',
+        exchange_order_id = null,
+        distance_atr = coalesce(${distanceAtr ?? null}, distance_atr),
+        updated_at = now()
+    where id = ${id} and status = 'pending'
+    returning id
+  `;
+  return Boolean(rows[0]?.id);
+}
+
+export async function updateLimitOrderDistance(id: number, distanceAtr: number) {
+  const sql = await getSql();
+  await sql`
+    update limit_orders
+    set distance_atr = ${distanceAtr}, updated_at = now()
+    where id = ${id} and status in ('pending', 'watch')
+  `;
+}
+
+export async function trimWatchQueueExcess(maxKeep = 40) {
+  const sql = await getSql();
+  const rows = await sql<{ id: number }>`
+    select id from limit_orders
+    where status = 'watch'
+    order by coalesce(distance_atr, 999) asc, updated_at desc, id asc
+    offset ${maxKeep}
+  `;
+  if (!rows.length) return;
+  const ids = rows.map((r) => r.id);
+  const placeholders = ids.map((_, i) => `$${i + 1}`).join(", ");
+  await sql.query(`delete from limit_orders where status = 'watch' and id in (${placeholders})`, ids);
+}
+
 export async function markLimitOrderFilled(id: number, extra?: { exchangeOrderId?: string | null }) {
   const sql = await getSql();
   await sql`
@@ -1033,7 +1230,7 @@ export async function markLimitOrderFilled(id: number, extra?: { exchangeOrderId
         exchange_order_id = coalesce(${extra?.exchangeOrderId ?? null}, exchange_order_id),
         updated_at = now(),
         closed_at = now()
-    where id = ${id} and status = 'pending'
+    where id = ${id} and status in ('pending', 'watch')
   `;
 }
 
@@ -1045,7 +1242,7 @@ export async function cancelLimitOrder(id: number, reason: string) {
         cancel_reason = ${reason},
         updated_at = now(),
         closed_at = now()
-    where id = ${id} and status = 'pending'
+    where id = ${id} and status in ('pending', 'watch')
   `;
 }
 

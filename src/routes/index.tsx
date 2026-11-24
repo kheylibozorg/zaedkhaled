@@ -44,6 +44,9 @@ function Home() {
   const [entryMode, setEntryMode] = useState<"limit" | "market">(s.entryMode === "market" ? "market" : "limit");
   const [safeLimitMode, setSafeLimitMode] = useState<boolean>(s.safeLimitMode ?? true);
   const [limitTtlBars, setLimitTtlBars] = useState(String(s.limitTtlBars ?? 0));
+  const [maxLimitQueue, setMaxLimitQueue] = useState(String(s.maxLimitQueue ?? 8));
+  const [autoTrimExcess, setAutoTrimExcess] = useState<boolean>(s.autoTrimExcess ?? false);
+  const [queueFilter, setQueueFilter] = useState<"all" | "pending" | "watch">("all");
   const [cancellingLimitId, setCancellingLimitId] = useState<number | null>(null);
   const [savedOk, setSavedOk] = useState(false);
   const [errMsg, setErrMsg] = useState<string | null>(null);
@@ -62,7 +65,9 @@ function Home() {
     setEntryMode(s.entryMode === "market" ? "market" : "limit");
     setSafeLimitMode(s.safeLimitMode ?? true);
     setLimitTtlBars(String(s.limitTtlBars ?? 0));
-  }, [s.capitalPct, s.capitalBase, s.scanBatch, s.maxPositions, s.htfMaxPositions, s.maxLeverage, s.stackLevCount, s.stackLevCap, s.levSizeTiers, s.minMarketCapUsd, s.entryMode, s.safeLimitMode, s.limitTtlBars]);
+    setMaxLimitQueue(String(s.maxLimitQueue ?? 8));
+    setAutoTrimExcess(s.autoTrimExcess ?? false);
+  }, [s.capitalPct, s.capitalBase, s.scanBatch, s.maxPositions, s.htfMaxPositions, s.maxLeverage, s.stackLevCount, s.stackLevCap, s.levSizeTiers, s.minMarketCapUsd, s.entryMode, s.safeLimitMode, s.limitTtlBars, s.maxLimitQueue, s.autoTrimExcess]);
   const pnl = Number(data.stats.pnl);
   const curve = data.equity.map((e) => ({
     t: new Date(e.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
@@ -90,6 +95,8 @@ function Home() {
           entry_mode: entryMode,
           safe_limit_mode: safeLimitMode ? 1 : 0,
           limit_ttl_bars: Math.min(48, Math.max(0, Math.round(Number(limitTtlBars) || 0))),
+          max_limit_queue: Math.min(40, Math.max(0, Math.round(Number(maxLimitQueue) || 0))),
+          auto_trim_excess: autoTrimExcess ? 1 : 0,
         },
       });
       setCapital(String(saved.capitalPct ?? capital));
@@ -105,6 +112,8 @@ function Home() {
       setEntryMode(saved.entryMode === "market" ? "market" : "limit");
       setSafeLimitMode(saved.safeLimitMode ?? true);
       setLimitTtlBars(String(saved.limitTtlBars ?? 0));
+      setMaxLimitQueue(String(saved.maxLimitQueue ?? 8));
+      setAutoTrimExcess(saved.autoTrimExcess ?? false);
       setSavedOk(true);
       await router.invalidate({ sync: true });
     } catch (e) {
@@ -376,7 +385,8 @@ function Home() {
               Number(s.htfMaxPositions) > 0
                 ? `1h/4h ${countHtfOpen(data.open.map((p) => p.timeframe))}/${s.htfMaxPositions}`
                 : "",
-              data.pendingLimits?.length ? `${locale === "fa" ? "صف" : "queued"} ${data.pendingLimits.length}` : "",
+              data.pendingLimits?.length ? `${locale === "fa" ? "صرافی" : "venue"} ${data.pendingLimits.length}` : "",
+              data.watchLimits?.length ? `${locale === "fa" ? "کمین" : "watch"} ${data.watchLimits.length}` : "",
             ]
               .filter(Boolean)
               .join(" · ")}
@@ -694,6 +704,58 @@ function Home() {
               </div>
               <p className="text-xs text-subtle">{t.limitTtlHint}</p>
             </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="desk-max-queue">{t.maxLimitQueue}</Label>
+              <Input
+                id="desk-max-queue"
+                type="number"
+                min={0}
+                max={40}
+                step={1}
+                value={maxLimitQueue}
+                disabled={!unlocked || saving}
+                onChange={(e) => setMaxLimitQueue(e.target.value)}
+              />
+              <div className="flex flex-wrap gap-1">
+                {[0, 4, 8, 12, 16, 20].map((n) => (
+                  <button
+                    key={n}
+                    type="button"
+                    disabled={!unlocked || saving}
+                    onClick={() => setMaxLimitQueue(String(n))}
+                    className={`min-h-8 rounded-sm border px-2 text-xs ${
+                      Number(maxLimitQueue) === n
+                        ? "border-accent bg-surface-2 text-fg"
+                        : "border-border text-muted hover:border-border-strong"
+                    } disabled:opacity-40`}
+                  >
+                    {n === 0 ? (locale === "fa" ? "خودکار" : "auto") : n}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-subtle">{t.maxLimitQueueHint}</p>
+            </div>
+            <div className="grid gap-1.5">
+              <Label>{t.autoTrimExcess}</Label>
+              <div className="grid grid-cols-2 gap-1.5">
+                {([true, false] as const).map((on) => (
+                  <button
+                    key={String(on)}
+                    type="button"
+                    disabled={!unlocked || saving}
+                    onClick={() => setAutoTrimExcess(on)}
+                    className={`min-h-10 rounded-sm border px-2 text-xs ${
+                      autoTrimExcess === on
+                        ? "border-accent bg-surface-2 text-fg"
+                        : "border-border text-muted hover:border-border-strong"
+                    } disabled:opacity-40`}
+                  >
+                    {on ? t.autoTrimOn : t.autoTrimOff}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-subtle">{t.autoTrimHint}</p>
+            </div>
           </div>
           <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border/60 pt-3">
             <div className="min-h-4 text-xs">
@@ -768,16 +830,42 @@ function Home() {
         </section>
 
         <section className="rounded-lg border border-border bg-surface p-4 shadow-panel">
-          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-            <h2 className="text-sm font-medium">{t.limitQueue}</h2>
-            <span className="text-xs text-subtle">
-              {locale === "fa"
-                ? `${data.pendingLimits?.length ?? 0} در صف · ${s.safeLimitMode ? "سقف امن روشن" : "سقف امن خاموش"}`
-                : `${data.pendingLimits?.length ?? 0} pending · ${s.safeLimitMode ? "safe cap on" : "safe cap off"}`}
-            </span>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-medium">{t.limitQueue}</h2>
+              <span className="text-xs text-subtle">
+                {locale === "fa"
+                  ? `${data.pendingLimits?.length ?? 0} روی صرافی · ${data.watchLimits?.length ?? 0} در کمین ربات · سقف صرافی ${s.safeLimitMode ? `${s.maxPositions} (امن)` : s.maxLimitQueue > 0 ? s.maxLimitQueue : "خودکار"}${s.autoTrimExcess ? " · بستن مازاد روشن" : ""}`
+                  : `${data.pendingLimits?.length ?? 0} on venue · ${data.watchLimits?.length ?? 0} bot watch · venue cap ${s.safeLimitMode ? `${s.maxPositions} (safe)` : s.maxLimitQueue > 0 ? s.maxLimitQueue : "auto"}${s.autoTrimExcess ? " · auto-trim on" : ""}`}
+              </span>
+            </div>
+            <div className="flex flex-wrap gap-1">
+              {(
+                [
+                  { id: "all", fa: "همه", en: "All" },
+                  { id: "pending", fa: `صف صرافی (${data.pendingLimits?.length ?? 0})`, en: `Venue (${data.pendingLimits?.length ?? 0})` },
+                  { id: "watch", fa: `کمین ربات (${data.watchLimits?.length ?? 0})`, en: `Watch (${data.watchLimits?.length ?? 0})` },
+                ] as const
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setQueueFilter(tab.id)}
+                  className={`min-h-8 rounded-sm border px-2.5 text-xs ${
+                    queueFilter === tab.id
+                      ? "border-accent bg-surface-2 text-fg"
+                      : "border-border text-muted hover:border-border-strong"
+                  }`}
+                >
+                  {locale === "fa" ? tab.fa : tab.en}
+                </button>
+              ))}
+            </div>
           </div>
           <LimitOrdersTable
-            rows={data.recentLimits ?? []}
+            rows={(data.recentLimits ?? []).filter((r) =>
+              queueFilter === "all" ? true : r.status === queueFilter,
+            )}
             empty={t.noLimits}
             onCancel={cancelPending}
             cancellingId={cancellingLimitId}

@@ -18,6 +18,7 @@ import {
   listScanLog,
   listSignals,
   listUniverse,
+  listWatchLimitOrders,
   patchSettings,
   publicSettings,
   replaceUniverse,
@@ -73,7 +74,7 @@ export const getDesk = createServerFn({ method: "GET" }).handler(async () => {
     }
   }
   universe = filterByMinCap(universe, minCapUsd(settings.minMarketCapUsd), (a) => Number(a.market_cap_usd));
-  const [openRaw, closed, signals, equity, scans, st, pendingLimits, recentLimits] = await Promise.all([
+  const [openRaw, closed, signals, equity, scans, st, pendingLimits, watchLimits, recentLimits] = await Promise.all([
     listOpenPositions(),
     listClosedPositions(60),
     listSignals(60),
@@ -81,7 +82,8 @@ export const getDesk = createServerFn({ method: "GET" }).handler(async () => {
     listScanLog(24),
     stats(),
     listPendingLimitOrders(),
-    listRecentLimitOrders(40),
+    listWatchLimitOrders(),
+    listRecentLimitOrders(60),
   ]);
   const live = await overlayLiveSnapshot(settings, openRaw);
   return {
@@ -91,6 +93,7 @@ export const getDesk = createServerFn({ method: "GET" }).handler(async () => {
     closed,
     signals,
     pendingLimits,
+    watchLimits,
     recentLimits,
     equity: equity.reverse(),
     scans,
@@ -104,10 +107,10 @@ export const cancelQueuedLimitOrder = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     await requireOperator();
     const order = await getLimitOrderById(data.id);
-    if (!order || order.status !== "pending") {
+    if (!order || (order.status !== "pending" && order.status !== "watch")) {
       return { ok: true as const, cancelled: false as const };
     }
-    if (order.mode === "live" && order.exchange_order_id) {
+    if (order.status === "pending" && order.mode === "live" && order.exchange_order_id) {
       const settings = await getSettings();
       const venue = bookVenue(order.venue || settings.venue);
       if (venue !== "paper" && hasLiveKeys(settings, venue)) {
@@ -189,6 +192,8 @@ export const saveDeskSettings = createServerFn({ method: "POST" })
       entry_mode: z.enum(["limit", "market"]).optional(),
       safe_limit_mode: z.number().int().min(0).max(1).optional(),
       limit_ttl_bars: z.number().int().min(0).max(48).optional(),
+      max_limit_queue: z.number().int().min(0).max(40).optional(),
+      auto_trim_excess: z.number().int().min(0).max(1).optional(),
     }),
   )
   .handler(async ({ data }) => {

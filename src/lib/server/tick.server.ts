@@ -41,6 +41,7 @@ import {
 import {
   canQueueLimitOrder,
   evaluatePendingLimit,
+  isValidLimitGeometry,
   parseEntryMode,
   resolveLimitTtlBars,
 } from "@/lib/engine/limit-queue";
@@ -51,6 +52,17 @@ import {
   scanPreArmedClosed,
   type PreArmedSetup,
 } from "@/lib/engine/pre-arm";
+import {
+  MAX_WATCH_QUEUE_SIZE,
+  approachDistanceAtr,
+  clampMaxLimitQueue,
+  pickSwapVictim,
+  rankQueueCandidates,
+  resolveSmartLimitTtlBars,
+  shouldStageInWatchQueue,
+  type ActivePendingOrderView,
+} from "@/lib/engine/smart-queue";
+import { selectExcessToClose } from "@/lib/engine/excess-trim";
 import { FEE_BPS, HTF2_OF, HTF_OF, TF_MS, WARMUP, type IndicatorName, type KlineTf, type Timeframe, type VenueId } from "@/lib/engine/types";
 import {
   dueTimeframes,
@@ -74,6 +86,7 @@ import {
   bumpEquity,
   cancelLimitOrder,
   closePosition,
+  demoteLimitOrderToWatch,
   dropOrphanFill,
   getSettings,
   heartbeatTickLock,
@@ -86,8 +99,10 @@ import {
   listPendingLimitOrders,
   listRecentLimitOrders,
   listUniverse,
+  listWatchLimitOrders,
   logScan,
   markLimitOrderFilled,
+  promoteWatchLimitOrder,
   publicSettings,
   rememberOrphanFill,
   releaseTickLock,
@@ -97,7 +112,10 @@ import {
   setUniverseVenue,
   snapshotEquity,
   touchTick,
+  trimWatchQueueExcess,
+  updateLimitOrderDistance,
   updatePositionSl,
+  upsertWatchLimitOrder,
   markScanProgress,
   type LimitOrderRow,
   type PositionRow,
@@ -922,7 +940,101 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     }
   }
 
-  const stillOpen = await listOpenPositions();
+  let stillOpen = await listOpenPositions();
+  const maxPos = clampMaxPositions(settings.max_positions);
+  const autoTrimExcess = Boolean(Number(settings.auto_trim_excess));
+  if (autoTrimExcess && stillOpen.length > maxPos) {
+    const trimEligible = stillOpen.filter((p) => {
+      if (live && adapter) {
+        return p.mode === "live" && (!p.venue || p.venue === "paper" || bookVenue(p.venue) === venue);
+      }
+      return p.mode !== "live";
+    });
+    if (trimEligible.length > maxPos) {
+      const markPrices: Record<string, number> = {};
+      await mapPool(trimEligible, 4, async (p) => {
+        const cachedBars = lastBars.get(p.symbol);
+        const closed5 = cachedBars?.length ? onlyClosedBars(cachedBars, "5m") : [];
+        if (closed5.length) markPrices[p.symbol] = closed5[closed5.length - 1]!.close;
+        if (live && adapter) {
+          try {
+            const px = await withTimeout(fetchVenueLastPrice(venue, p.symbol), 3000);
+            if (Number.isFinite(px) && px > 0) markPrices[p.symbol] = px;
+          } catch {
+            /* keep closed 5m fallback */
+          }
+        }
+      });
+      const victims = selectExcessToClose(trimEligible, maxPos, markPrices);
+      for (const v of victims) {
+        const pos = v.position;
+        const holdMs = Math.max(0, Date.now() - new Date(pos.opened_at).getTime());
+        const side = pos.side === "short" ? ("short" as const) : ("long" as const);
+        if (live && adapter && pos.mode === "live") {
+          try {
+            const res = await adapter.closePosition(acc, venueSymbol(venue, pos.symbol));
+            if (!res.ok && res.message !== "flat") continue;
+          } catch {
+            continue;
+          }
+          const resolved = await resolveLiveExit(adapter, acc, venue, pos, v.markPrice);
+          await closePosition(pos.id, resolved.exit, "excess trim", resolved.pnl, resolved.pnlR, {
+            holdMs,
+            beMoved: false,
+            feesUsd: resolved.fees,
+          });
+          closed += 1;
+        } else if (!live && pos.mode !== "live") {
+          const slipBps = paperSlippageBps({
+            entry: v.markPrice,
+            atr: pos.atr_at_entry ?? undefined,
+            kind: "sl_exit",
+          });
+          const exit = applyPaperSlippage(v.markPrice, side, "close", slipBps);
+          const settled = netClosePnl({
+            side,
+            entry: Number(pos.entry),
+            exit,
+            qty: Number(pos.qty),
+            riskUsd: Number(pos.risk_usd),
+            openFee: Number(pos.fees_usd),
+            closeFeeBps: PAPER_TAKER_BPS,
+            fundingUsd: estimatePaperFundingUsd(Number(pos.notional_usd), holdMs),
+          });
+          await closePosition(pos.id, exit, "excess trim", settled.pnl, settled.pnlR, {
+            holdMs,
+            beMoved: false,
+            feesUsd: settled.fees,
+          });
+          equity += settled.pnl;
+          await bumpEquity(settled.pnl);
+          closed += 1;
+        }
+      }
+      stillOpen = await listOpenPositions();
+      if (live && adapter) {
+        try {
+          venueBook = await adapter.fetchPositions(acc);
+        } catch {
+          /* keep prior venueBook */
+        }
+        if (liveBalReady) {
+          try {
+            const w = await withTimeout(readVenueWallet(adapter, acc), 4000);
+            if (w) {
+              equity = w.equity;
+              available = w.available;
+              await setEquity(equity);
+              walletAfterClose = true;
+            }
+          } catch {
+            /* keep prior wallet */
+          }
+        }
+      }
+    }
+  }
+
   const held = coinsHeld(
     stillOpen.map((p) => p.symbol),
     venueBook?.map((p) => p.symbol),
@@ -946,7 +1058,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   const nowMs = Date.now();
   const entryMode = parseEntryMode(settings.entry_mode);
   const safeLimitMode = settings.safe_limit_mode == null ? true : Boolean(Number(settings.safe_limit_mode));
-  const maxPos = clampMaxPositions(settings.max_positions);
+  const maxLimitQueue = settings.max_limit_queue == null ? 8 : clampMaxLimitQueue(settings.max_limit_queue);
   const htfMax = clampHtfMaxPositions(settings.htf_max_positions);
   let openCount = concurrentOpenCount(stillOpen.length, venueBook?.length ?? 0);
   let htfOpen = countHtfOpen(stillOpen.map((p) => p.timeframe));
@@ -955,8 +1067,22 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   const sideGates = parseSideGates(settings.engine_gates);
   const pendingTelegram: TelegramSignal[] = [];
 
+  type FoundArmed = ArmedSetup & {
+    symbol: string;
+    timeframe: Timeframe;
+    lastClosedBarTime: number;
+    phase?: "pre-arm";
+    matchTolerance?: number;
+    distanceAtr: number;
+    existingWatchId?: number | null;
+  };
+
   const pendingOrders = await listPendingLimitOrders();
+  const watchOrders = entryMode === "limit" ? await listWatchLimitOrders() : [];
   const resolvedPendingIds = new Set<number>();
+  const pendingDistMap = new Map<number, number>();
+  const pendingPhaseMap = new Map<number, "armed" | "pre-arm">();
+  const survivingWatch: FoundArmed[] = [];
 
   async function cancelPendingRow(o: LimitOrderRow, reason: string) {
     if (o.mode === "live" && live && adapter?.cancelOrder && o.exchange_order_id) {
@@ -975,12 +1101,52 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     await cancelLimitOrder(o.id, reason);
   }
 
+  async function demotePendingRowToWatch(o: LimitOrderRow, distanceAtr?: number): Promise<boolean> {
+    if (o.mode === "live" && live && adapter?.cancelOrder && o.exchange_order_id) {
+      try {
+        const res = await withTimeout(
+          adapter.cancelOrder(acc, {
+            symbol: venueSymbol(venue, o.symbol),
+            orderId: o.exchange_order_id,
+          }),
+          5000,
+        );
+        if (!res.ok) return false;
+      } catch {
+        return false;
+      }
+    }
+    return demoteLimitOrderToWatch(o.id, distanceAtr);
+  }
+
   async function cancelRemainingPending(reason: string) {
     for (const rem of pendingOrders) {
       if (resolvedPendingIds.has(rem.id)) continue;
       resolvedPendingIds.add(rem.id);
       await cancelPendingRow(rem, reason);
     }
+  }
+
+  const queueBarsNeed = new Set<string>();
+  for (const o of [...pendingOrders, ...watchOrders]) {
+    const tf = (o.timeframe as Timeframe) in TF_MS ? (o.timeframe as Timeframe) : "5m";
+    queueBarsNeed.add(`${o.symbol}|${tf}`);
+    queueBarsNeed.add(`${o.symbol}|5m`);
+    queueBarsNeed.add(`${o.symbol}|${HTF_OF[tf]}`);
+    queueBarsNeed.add(`${o.symbol}|${HTF2_OF[tf]}`);
+  }
+  const pendingBarsMap = new Map<string, ReturnType<typeof onlyClosedBars>>();
+  if (queueBarsNeed.size) {
+    await mapPool([...queueBarsNeed], 6, async (key) => {
+      const [sym, rawTf] = key.split("|") as [string, KlineTf];
+      const limit = rawTf === "1d" || rawTf === "1w" ? 80 : SCAN_BARS;
+      try {
+        const bars = await fetchKlinesCached(sym, rawTf, limit, venue);
+        pendingBarsMap.set(key, onlyClosedBars(bars, rawTf));
+      } catch {
+        pendingBarsMap.set(key, []);
+      }
+    });
   }
 
   if (pendingOrders.length) {
@@ -1007,25 +1173,6 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           liveOpenOrders = null;
         }
       }
-
-      const pendingNeed = new Set<string>();
-      for (const o of pendingOrders) {
-        const tf = (o.timeframe as Timeframe) in TF_MS ? (o.timeframe as Timeframe) : "5m";
-        pendingNeed.add(`${o.symbol}|${tf}`);
-        pendingNeed.add(`${o.symbol}|${HTF_OF[tf]}`);
-        pendingNeed.add(`${o.symbol}|${HTF2_OF[tf]}`);
-      }
-      const pendingBarsMap = new Map<string, ReturnType<typeof onlyClosedBars>>();
-      await mapPool([...pendingNeed], 6, async (key) => {
-        const [sym, rawTf] = key.split("|") as [string, KlineTf];
-        const limit = rawTf === "1d" || rawTf === "1w" ? 80 : SCAN_BARS;
-        try {
-          const bars = await fetchKlinesCached(sym, rawTf, limit, venue);
-          pendingBarsMap.set(key, onlyClosedBars(bars, rawTf));
-        } catch {
-          pendingBarsMap.set(key, []);
-        }
-      });
 
       for (const o of pendingOrders) {
         if (resolvedPendingIds.has(o.id)) continue;
@@ -1181,6 +1328,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         }
 
         const bars = pendingBarsMap.get(`${o.symbol}|${tf}`) ?? [];
+        const bars5m = pendingBarsMap.get(`${o.symbol}|5m`) ?? [];
         const htfBars = pendingBarsMap.get(`${o.symbol}|${HTF_OF[tf]}`) ?? [];
         const htf2Bars = pendingBarsMap.get(`${o.symbol}|${HTF2_OF[tf]}`) ?? [];
         let currentArmed: ArmedSetup | null | undefined = undefined;
@@ -1235,7 +1383,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             reason: o.reason,
           },
           closedBars: bars,
-          ttlBars: resolveLimitTtlBars(settings.limit_ttl_bars, o.ftc_wait),
+          ttlBars: resolveSmartLimitTtlBars(tf, settings.limit_ttl_bars, o.ftc_wait),
           gateMuted,
           capReached: openCount >= maxPos,
           htfCapReached: htfMax > 0 && htfOpen >= htfMax,
@@ -1278,7 +1426,6 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             await cancelLimitOrder(o.id, "pattern failed");
             continue;
           }
-          // Resolve exact 5m fill bar so HTF limit fills start 5m SL/TP checks right after the touch.
           let fill5mTime: number | null = null;
           try {
             const raw5m = lastBars.get(o.symbol) ?? (await fetchKlinesCached(o.symbol, "5m", SCAN_BARS, venue));
@@ -1366,8 +1513,135 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           } else {
             await cancelLimitOrder(o.id, "duplicate symbol");
           }
+          continue;
+        }
+
+        const freshPx =
+          bars5m.length > 0
+            ? bars5m[bars5m.length - 1]!.close
+            : bars.length > 0
+              ? bars[bars.length - 1]!.close
+              : Number(o.entry);
+        const distAtr = approachDistanceAtr({
+          entry: Number(o.entry),
+          currentPrice: freshPx,
+          atr: Number(o.atr) || Number(o.entry) * 0.01,
+        });
+        pendingDistMap.set(o.id, distAtr);
+        pendingPhaseMap.set(o.id, preArmOrder && !(currentArmed && currentArmed.side === side) ? "pre-arm" : "armed");
+        await updateLimitOrderDistance(o.id, distAtr).catch(() => undefined);
+      }
+    }
+  }
+
+  // Reconcile & refresh internal bot watch queue on every tick
+  if (entryMode === "limit" && watchOrders.length) {
+    const stillPendingAfterRecon = await listPendingLimitOrders();
+    const stillPendingCoins = coinsOf(stillPendingAfterRecon.map((o) => o.symbol));
+    for (const w of watchOrders) {
+      const tf = (w.timeframe as Timeframe) in TF_MS ? (w.timeframe as Timeframe) : "5m";
+      const coin = fillCoin(w.symbol);
+      const side = w.side === "short" ? ("short" as const) : ("long" as const);
+      const bars = pendingBarsMap.get(`${w.symbol}|${tf}`) ?? [];
+      const bars5m = pendingBarsMap.get(`${w.symbol}|5m`) ?? [];
+      const htfBars = pendingBarsMap.get(`${w.symbol}|${HTF_OF[tf]}`) ?? [];
+      const htf2Bars = pendingBarsMap.get(`${w.symbol}|${HTF2_OF[tf]}`) ?? [];
+      let currentArmed: ArmedSetup | null | undefined = undefined;
+      let currentPreArmed: PreArmedSetup | null | undefined = undefined;
+      const preArmOrder = isPreArmReason(w.reason);
+      if (bars.length >= MIN_BARS) {
+        try {
+          const htfOpt = htfBars.length > 20 ? htfBars : undefined;
+          const htf2Opt = htf2Bars.length > 10 ? htf2Bars : undefined;
+          const res = runIndicator(bars, tf, w.indicator as IndicatorName, htfOpt, htf2Opt);
+          currentArmed = res.armedSetup ?? null;
+          if (preArmOrder) {
+            if (currentArmed && currentArmed.side === side) {
+              currentPreArmed = null;
+            } else {
+              currentPreArmed = findPreArmedSetup(bars, tf, w.indicator as IndicatorName, htfOpt, htf2Opt);
+            }
+          }
+        } catch {
+          currentArmed = undefined;
+          currentPreArmed = undefined;
         }
       }
+      const gateMuted =
+        !isEngineOn(engineGates, w.indicator as IndicatorName, tf) ||
+        !isSideOn(sideGates, w.indicator, side);
+      const evalRes = evaluatePendingLimit({
+        order: {
+          symbol: w.symbol,
+          timeframe: tf,
+          indicator: w.indicator as IndicatorName,
+          side,
+          entry: Number(w.entry),
+          sl: Number(w.sl),
+          tp: Number(w.tp),
+          rr: Number(w.rr),
+          beAtR: w.be_at_r,
+          armedBarTime: Number(w.armed_bar_time),
+          ftcWait: Number(w.ftc_wait) || 8,
+          reason: w.reason,
+        },
+        closedBars: bars,
+        ttlBars: resolveLimitTtlBars(settings.limit_ttl_bars, w.ftc_wait),
+        gateMuted,
+        capReached: false,
+        htfCapReached: false,
+        duplicateHeld: held.has(coin) || stillPendingCoins.has(coin),
+        currentArmed,
+        currentPreArmed,
+      });
+
+      if (evalRes.action === "cancel") {
+        await cancelLimitOrder(w.id, evalRes.cancelReason);
+        continue;
+      }
+      if (evalRes.action === "fill") {
+        // Never phantom-fill an internal watch setup that was never submitted to the venue.
+        await cancelLimitOrder(w.id, "pattern failed");
+        continue;
+      }
+
+      const freshPx =
+        bars5m.length > 0
+          ? bars5m[bars5m.length - 1]!.close
+          : bars.length > 0
+            ? bars[bars.length - 1]!.close
+            : Number(w.entry);
+      const upgradedArmed = currentArmed && currentArmed.side === side ? currentArmed : null;
+      const refreshedPre = !upgradedArmed && currentPreArmed && currentPreArmed.side === side ? currentPreArmed : null;
+      const entry = upgradedArmed ? upgradedArmed.entry : refreshedPre ? refreshedPre.entry : Number(w.entry);
+      const sl = upgradedArmed ? upgradedArmed.sl : refreshedPre ? refreshedPre.sl : Number(w.sl);
+      const tp = upgradedArmed ? upgradedArmed.tp : refreshedPre ? refreshedPre.tp : Number(w.tp);
+      const rr = upgradedArmed ? upgradedArmed.rr : refreshedPre ? refreshedPre.rr : Number(w.rr);
+      const atr = upgradedArmed ? upgradedArmed.atr : refreshedPre ? refreshedPre.atr : Number(w.atr) || entry * 0.01;
+      const reason = upgradedArmed ? upgradedArmed.reason : refreshedPre ? refreshedPre.reason : w.reason ?? "";
+      const distAtr = approachDistanceAtr({ entry, currentPrice: freshPx, atr });
+      await updateLimitOrderDistance(w.id, distAtr).catch(() => undefined);
+
+      survivingWatch.push({
+        symbol: w.symbol,
+        timeframe: tf,
+        indicator: w.indicator as IndicatorName,
+        side,
+        entry,
+        sl,
+        tp,
+        rr,
+        atr,
+        reason,
+        armedBarTime: Number(w.armed_bar_time),
+        armedBarIndex: upgradedArmed ? upgradedArmed.armedBarIndex : refreshedPre ? refreshedPre.armedBarIndex : Math.max(0, bars.length - 1),
+        armAge: upgradedArmed ? upgradedArmed.armAge : refreshedPre ? refreshedPre.armAge : 0,
+        ftcWait: Number(w.ftc_wait) || 8,
+        lastClosedBarTime: bars[bars.length - 1]?.time ?? Number(w.armed_bar_time),
+        phase: upgradedArmed ? undefined : preArmOrder ? "pre-arm" : undefined,
+        distanceAtr: distAtr,
+        existingWatchId: w.id,
+      });
     }
   }
 
@@ -1379,6 +1653,143 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   };
   const tfs = dueTimeframes(nowMs, scanDone, opts.source);
   if (!tfs.length) {
+    if (entryMode === "limit" && survivingWatch.length && openCount < maxPos) {
+      const activeBetweenScans = await listPendingLimitOrders();
+      const pendingCoinsBetween = coinsOf(activeBetweenScans.map((o) => o.symbol));
+      let pendingCnt = activeBetweenScans.length;
+      let htfPendingCnt = countHtfOpen(activeBetweenScans.map((o) => o.timeframe));
+      let reservedMarginBetween = activeBetweenScans.reduce((accM, o) => accM + Math.max(0, Number(o.margin_usd) || 0), 0);
+      const rankedWatch = rankQueueCandidates(
+        survivingWatch.map((c) => ({
+          ...c,
+          coin: fillCoin(c.symbol),
+          phase: c.phase === "pre-arm" ? ("pre-arm" as const) : ("armed" as const),
+        })),
+      );
+      const levCapB = Math.min(200, Math.max(1, Math.round(Number(settings.max_leverage) || 200)));
+      const rawStackB = Number(settings.stack_lev_count);
+      const stackCntB = Number.isFinite(rawStackB) ? Math.max(0, Math.round(rawStackB)) : 2;
+      const stackCapB = Math.min(200, Math.max(1, Math.round(Number(settings.stack_lev_cap) || 75)));
+      const capPctDefB = Number(settings.capital_pct) || DEFAULT_CAPITAL_PCT;
+      const capBaseB = parseCapitalBase(settings.capital_base);
+      const tiersB = parseLevSizeTiers(settings.lev_size_tiers);
+      for (const cand of rankedWatch) {
+        if (shouldStageInWatchQueue({ timeframe: cand.timeframe, phase: cand.phase, distanceAtr: cand.distanceAtr })) {
+          continue;
+        }
+        const gateCheck = canQueueLimitOrder({
+          safeLimitMode,
+          maxPositions: settings.max_positions,
+          htfMaxPositions: settings.htf_max_positions,
+          maxLimitQueue,
+          timeframe: cand.timeframe,
+          coin: cand.coin,
+          heldCoins: held,
+          pendingCoins: pendingCoinsBetween,
+          openCount,
+          pendingCount: pendingCnt,
+          htfOpenCount: htfOpen,
+          htfPendingCount: htfPendingCnt,
+          sideOn: isSideOn(sideGates, cand.indicator, cand.side),
+          side: cand.side,
+          entry: cand.entry,
+          sl: cand.sl,
+          tp: cand.tp,
+        });
+        if (!gateCheck.ok) continue;
+        if (live && (!liveBalReady || !liveBookReady || liveBlock)) continue;
+        const sizingAvail = safeLimitMode ? Math.max(0, available - reservedMarginBetween) : available;
+        if (sizingAvail <= 0) continue;
+        const coinMax = capLeverage(await resolveMaxLeverage(venue, venue === "paper" ? cand.symbol : venueSymbol(venue, cand.symbol), acc));
+        const lev = Math.min(stackedUserLevCap(levCapB, openLevs, stackCntB, stackCapB), coinMax);
+        const capPct = capitalPctForLeverage(coinMax, capPctDefB, tiersB);
+        const sized = sizePosition({
+          equity,
+          capitalPct: capPct,
+          entry: cand.entry,
+          sl: cand.sl,
+          leverage: lev,
+          usedMargin,
+          available: sizingAvail,
+          capitalBase: capBaseB,
+          minNotionalUsd: live ? 0 : PAPER_MIN_NOTIONAL_USD,
+          feeBps: PAPER_MAKER_BPS,
+        });
+        if (!sized) continue;
+        const ttlBars = resolveSmartLimitTtlBars(cand.timeframe, settings.limit_ttl_bars, cand.ftcWait);
+        if (live && adapter) {
+          if (!hasLiveKeys(settings, venue) || !adapter.placeLimitOrder) continue;
+          if (!(await heartbeatTickLock(opts.lock))) continue;
+          try {
+            const liveLast = await fetchVenueLastPrice(venue, cand.symbol);
+            if (Number.isFinite(liveLast) && liveLast > 0) {
+              const slBreachedNow = cand.side === "long" ? liveLast <= cand.sl : liveLast >= cand.sl;
+              if (slBreachedNow) {
+                if (cand.existingWatchId) await cancelLimitOrder(cand.existingWatchId, "sl engulfed");
+                continue;
+              }
+            }
+            const vs = venueSymbol(venue, cand.symbol);
+            const lmtRes = await adapter.placeLimitOrder(acc, {
+              symbol: vs,
+              side: cand.side,
+              qty: sized.qty,
+              leverage: lev,
+              entry: cand.entry,
+              sl: cand.sl,
+              tp: cand.tp,
+            });
+            if (!lmtRes.ok || lmtRes.filled) continue;
+            if (cand.existingWatchId) {
+              await promoteWatchLimitOrder(cand.existingWatchId, {
+                entry: cand.entry,
+                sl: cand.sl,
+                tp: cand.tp,
+                rr: cand.rr,
+                atr: cand.atr,
+                qty: sized.qty,
+                leverage: lev,
+                notionalUsd: sized.notional,
+                riskUsd: sized.risk,
+                marginUsd: sized.margin,
+                maxWaitBars: ttlBars,
+                reason: cand.reason,
+                distanceAtr: cand.distanceAtr,
+                exchangeOrderId: lmtRes.orderId ?? null,
+              });
+              pendingCoinsBetween.add(cand.coin);
+              pendingCnt += 1;
+              if (isHtfTf(cand.timeframe)) htfPendingCnt += 1;
+              reservedMarginBetween += sized.margin;
+            }
+          } catch {
+            continue;
+          }
+        } else if (cand.existingWatchId) {
+          const promoted = await promoteWatchLimitOrder(cand.existingWatchId, {
+            entry: cand.entry,
+            sl: cand.sl,
+            tp: cand.tp,
+            rr: cand.rr,
+            atr: cand.atr,
+            qty: sized.qty,
+            leverage: lev,
+            notionalUsd: sized.notional,
+            riskUsd: sized.risk,
+            marginUsd: sized.margin,
+            maxWaitBars: ttlBars,
+            reason: cand.reason,
+            distanceAtr: cand.distanceAtr,
+          });
+          if (promoted) {
+            pendingCoinsBetween.add(cand.coin);
+            pendingCnt += 1;
+            if (isHtfTf(cand.timeframe)) htfPendingCnt += 1;
+            reservedMarginBetween += sized.margin;
+          }
+        }
+      }
+    }
     if (pendingTelegram.length) {
       await notifySignalsTelegram(settings, venue, pendingTelegram).catch(() => undefined);
     }
@@ -1447,13 +1858,6 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     reason: string;
     barTime: number;
   };
-  type FoundArmed = ArmedSetup & {
-    symbol: string;
-    timeframe: Timeframe;
-    lastClosedBarTime: number;
-    phase?: "pre-arm";
-    matchTolerance?: number;
-  };
   const found: Found[] = [];
   const foundArmed: FoundArmed[] = [];
   const foundPreArmed: FoundArmed[] = [];
@@ -1516,20 +1920,31 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         const htf2Opt = htf2Closed.length > 10 ? htf2Closed : undefined;
         const armedList = scanArmedClosed(closedBars, tf, htfOpt, htf2Opt, names);
         const preArmedList = scanPreArmedClosed(closedBars, tf, htfOpt, htf2Opt, names);
-        const lastClosedBarTime = closedBars[closedBars.length - 1]!.time;
+        const lastClosedBar = closedBars[closedBars.length - 1]!;
+        const lastClosedBarTime = lastClosedBar.time;
         const armedIndHere = new Set<string>();
         for (const a of armedList) {
           armedIndHere.add(a.indicator);
           const key = `${asset.symbol}|${tf}|${a.indicator}|${a.armedBarTime}`;
           if (seenArmed.has(key)) continue;
           seenArmed.add(key);
-          foundArmed.push({ ...a, symbol: asset.symbol, timeframe: tf, lastClosedBarTime });
+          const distanceAtr = approachDistanceAtr({
+            entry: a.entry,
+            currentPrice: lastClosedBar.close,
+            atr: a.atr,
+          });
+          foundArmed.push({ ...a, symbol: asset.symbol, timeframe: tf, lastClosedBarTime, distanceAtr });
         }
         for (const pre of preArmedList) {
           if (armedIndHere.has(pre.indicator)) continue;
           const key = `${asset.symbol}|${tf}|${pre.indicator}|${pre.armedBarTime}`;
           if (seenArmed.has(key)) continue;
           seenArmed.add(key);
+          const distanceAtr = approachDistanceAtr({
+            entry: pre.entry,
+            currentPrice: lastClosedBar.close,
+            atr: pre.atr,
+          });
           foundPreArmed.push({
             ...pre,
             symbol: asset.symbol,
@@ -1537,6 +1952,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             lastClosedBarTime,
             phase: "pre-arm",
             matchTolerance: pre.matchTolerance,
+            distanceAtr,
           });
         }
       } else {
@@ -1609,8 +2025,10 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     }
   }
 
-  const queuedCandidates = foundArmed.length || foundPreArmed.length ? [...foundArmed, ...foundPreArmed] : [];
-  signals = entryMode === "limit" ? queuedCandidates.length : found.length;
+  const allLimitSetups =
+    entryMode === "limit" ? [...foundArmed, ...foundPreArmed, ...survivingWatch] : [];
+  const scannedSignalCount = foundArmed.length + foundPreArmed.length;
+  signals = entryMode === "limit" ? scannedSignalCount : found.length;
   const remainingSlots = Math.max(0, maxPos - openCount);
   let used = 0;
   const capitalPctDefault = Number(settings.capital_pct) || DEFAULT_CAPITAL_PCT;
@@ -1631,19 +2049,14 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     return n;
   }
 
-  if (entryMode === "limit" && queuedCandidates.length) {
+  if (entryMode === "limit" && allLimitSetups.length) {
     const activeAfterRecon = await listPendingLimitOrders();
     const recentCancelledLimits = foundPreArmed.length ? await listRecentLimitOrders(80).catch(() => []) : [];
-    const pendingCoins = coinsOf(activeAfterRecon.map((o) => o.symbol));
-    let pendingCount = activeAfterRecon.length;
-    let htfPendingCount = countHtfOpen(activeAfterRecon.map((o) => o.timeframe));
-    let reservedPendingMargin = activeAfterRecon.reduce((accM, o) => accM + Math.max(0, Number(o.margin_usd) || 0), 0);
-
-    for (const armed of queuedCandidates) {
-      const coin = fillCoin(armed.symbol);
+    const filteredSetups = allLimitSetups.filter((armed) => {
+      if (armed.existingWatchId) return true;
       const ttlBars = resolveLimitTtlBars(settings.limit_ttl_bars, armed.ftcWait);
       const barsSinceArm = Math.max(0, Math.round((armed.lastClosedBarTime - armed.armedBarTime) / TF_MS[armed.timeframe]));
-      if (barsSinceArm >= ttlBars) continue;
+      if (barsSinceArm >= ttlBars) return false;
       if (armed.phase === "pre-arm" && recentCancelledLimits.length) {
         const cooldownMs = ttlBars * TF_MS[armed.timeframe];
         const recentlyStoppedSameLevel = recentCancelledLimits.some((r) => {
@@ -1671,29 +2084,74 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             matchTolerance: armed.matchTolerance ?? armed.entry * 0.002,
           });
         });
-        if (recentlyStoppedSameLevel) continue;
+        if (recentlyStoppedSameLevel) return false;
       }
+      return true;
+    });
 
-      const gateCheck = canQueueLimitOrder({
-        safeLimitMode,
-        maxPositions: settings.max_positions,
-        htfMaxPositions: settings.htf_max_positions,
+    const rankedCandidates = rankQueueCandidates(
+      filteredSetups.map((c) => ({
+        ...c,
+        coin: fillCoin(c.symbol),
+        phase: c.phase === "pre-arm" ? ("pre-arm" as const) : ("armed" as const),
+      })),
+    );
+
+    const pendingCoins = coinsOf(activeAfterRecon.map((o) => o.symbol));
+    let pendingCount = activeAfterRecon.length;
+    let htfPendingCount = countHtfOpen(activeAfterRecon.map((o) => o.timeframe));
+    let reservedPendingMargin = activeAfterRecon.reduce((accM, o) => accM + Math.max(0, Number(o.margin_usd) || 0), 0);
+    const activeView: ActivePendingOrderView[] = activeAfterRecon.map((o) => ({
+      id: o.id,
+      symbol: o.symbol,
+      coin: fillCoin(o.symbol),
+      timeframe: ((o.timeframe as Timeframe) in TF_MS ? (o.timeframe as Timeframe) : "5m"),
+      phase: pendingPhaseMap.get(o.id) ?? (isPreArmReason(o.reason) ? "pre-arm" : "armed"),
+      distanceAtr: pendingDistMap.get(o.id) ?? (Number.isFinite(Number(o.distance_atr)) ? Number(o.distance_atr) : 1),
+    }));
+
+    async function stageInBotWatch(
+      armed: (typeof rankedCandidates)[number],
+      lev: number,
+      sizedPreview: { qty: number; notional: number; risk: number; margin: number } | null,
+    ) {
+      const watchTtl = resolveLimitTtlBars(settings.limit_ttl_bars, armed.ftcWait);
+      const previewEquity = equity > 0 ? equity : Number(settings.equity_usd) || 10000;
+      const previewMargin = sizedPreview?.margin ?? previewEquity * (capitalPctDefault / 100);
+      const previewNotional = sizedPreview?.notional ?? previewMargin * lev;
+      const previewQty = sizedPreview?.qty ?? (armed.entry > 0 ? previewNotional / armed.entry : 0);
+      const previewRisk = sizedPreview?.risk ?? previewQty * Math.abs(armed.entry - armed.sl);
+      await upsertWatchLimitOrder({
+        mode: live ? "live" : "paper",
+        venue: live ? venue : "paper",
+        symbol: armed.symbol,
         timeframe: armed.timeframe,
-        coin,
-        heldCoins: held,
-        pendingCoins,
-        openCount,
-        pendingCount,
-        htfOpenCount: htfOpen,
-        htfPendingCount,
-        sideOn: isSideOn(sideGates, armed.indicator, armed.side),
+        indicator: armed.indicator,
         side: armed.side,
         entry: armed.entry,
         sl: armed.sl,
         tp: armed.tp,
-      });
-      if (!gateCheck.ok) continue;
+        rr: armed.rr,
+        atr: armed.atr,
+        beAtR: trexBeAtR(armed.indicator),
+        qty: previewQty,
+        leverage: lev,
+        notionalUsd: previewNotional,
+        riskUsd: previewRisk,
+        marginUsd: previewMargin,
+        armedBarTime: armed.armedBarTime,
+        ftcWait: armed.ftcWait,
+        maxWaitBars: watchTtl,
+        reason: armed.reason,
+        distanceAtr: armed.distanceAtr,
+      }).catch(() => undefined);
+    }
 
+    for (const armed of rankedCandidates) {
+      const coin = armed.coin;
+      if (!isSideOn(sideGates, armed.indicator, armed.side)) continue;
+      if (!isValidLimitGeometry(armed.side, armed.entry, armed.sl, armed.tp)) continue;
+      if (held.has(coin) || pendingCoins.has(coin)) continue;
       if (filledBars.has(barFillKey(armed.symbol, armed.timeframe, armed.armedBarTime))) continue;
       if (
         await alreadyFilled({
@@ -1707,8 +2165,34 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       ) {
         continue;
       }
-      if (live && (!liveBalReady || !liveBookReady)) continue;
-      if (liveBlock) continue;
+
+      const coinMax = await coinMaxLev(armed.symbol);
+      const lev = Math.min(stackedUserLevCap(userLevCap, openLevs, stackCount, stackCap), coinMax);
+      const capitalPct = capitalPctForLeverage(coinMax, capitalPctDefault, levSizeTiers);
+
+      const mustStageWatch =
+        shouldStageInWatchQueue({ timeframe: armed.timeframe, phase: armed.phase, distanceAtr: armed.distanceAtr }) ||
+        openCount >= maxPos ||
+        (isHtfTf(armed.timeframe) && htfMax > 0 && htfOpen >= htfMax) ||
+        Boolean(liveBlock) ||
+        (live && (!liveBalReady || !liveBookReady));
+
+      if (mustStageWatch) {
+        const previewSized = sizePosition({
+          equity: equity > 0 ? equity : Number(settings.equity_usd) || 10000,
+          capitalPct,
+          entry: armed.entry,
+          sl: armed.sl,
+          leverage: lev,
+          usedMargin: 0,
+          available: equity > 0 ? equity : Number(settings.equity_usd) || 10000,
+          capitalBase,
+          minNotionalUsd: live ? 0 : PAPER_MIN_NOTIONAL_USD,
+          feeBps: PAPER_MAKER_BPS,
+        });
+        await stageInBotWatch(armed, lev, previewSized);
+        continue;
+      }
 
       if (live && adapter && liveBalReady) {
         try {
@@ -1722,25 +2206,107 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         }
       }
 
-      const sizingAvail = safeLimitMode ? Math.max(0, available - reservedPendingMargin) : available;
-      if (sizingAvail <= 0) continue;
-
-      const coinMax = await coinMaxLev(armed.symbol);
-      const lev = Math.min(stackedUserLevCap(userLevCap, openLevs, stackCount, stackCap), coinMax);
-      const capitalPct = capitalPctForLeverage(coinMax, capitalPctDefault, levSizeTiers);
-      const sized = sizePosition({
-        equity,
-        capitalPct,
+      let gateCheck = canQueueLimitOrder({
+        safeLimitMode,
+        maxPositions: settings.max_positions,
+        htfMaxPositions: settings.htf_max_positions,
+        maxLimitQueue,
+        timeframe: armed.timeframe,
+        coin,
+        heldCoins: held,
+        pendingCoins,
+        openCount,
+        pendingCount,
+        htfOpenCount: htfOpen,
+        htfPendingCount,
+        sideOn: true,
+        side: armed.side,
         entry: armed.entry,
         sl: armed.sl,
-        leverage: lev,
-        usedMargin,
-        available: sizingAvail,
-        capitalBase,
-        minNotionalUsd: live ? 0 : PAPER_MIN_NOTIONAL_USD,
-        feeBps: PAPER_MAKER_BPS,
+        tp: armed.tp,
       });
-      if (!sized) continue;
+
+      if (!gateCheck.ok) {
+        const swappable =
+          gateCheck.reason === "safe limit cap reached" ||
+          gateCheck.reason === "queue cap reached" ||
+          gateCheck.reason === "safe htf cap reached";
+        if (swappable) {
+          const victim = pickSwapVictim({
+            incoming: armed,
+            activePending: activeView,
+            htfMaxPositions: settings.htf_max_positions,
+            htfOpenCount: htfOpen,
+            htfPendingCount,
+          });
+          if (victim) {
+            const victimRow = activeAfterRecon.find((r) => r.id === victim.id);
+            if (victimRow && (await demotePendingRowToWatch(victimRow, victim.distanceAtr))) {
+              const vIdx = activeView.findIndex((x) => x.id === victim.id);
+              if (vIdx >= 0) activeView.splice(vIdx, 1);
+              pendingCoins.delete(victim.coin);
+              pendingCount = Math.max(0, pendingCount - 1);
+              if (isHtfTf(victim.timeframe)) htfPendingCount = Math.max(0, htfPendingCount - 1);
+              reservedPendingMargin = Math.max(0, reservedPendingMargin - Math.max(0, Number(victimRow.margin_usd) || 0));
+              gateCheck = canQueueLimitOrder({
+                safeLimitMode,
+                maxPositions: settings.max_positions,
+                htfMaxPositions: settings.htf_max_positions,
+                maxLimitQueue,
+                timeframe: armed.timeframe,
+                coin,
+                heldCoins: held,
+                pendingCoins,
+                openCount,
+                pendingCount,
+                htfOpenCount: htfOpen,
+                htfPendingCount,
+                sideOn: true,
+                side: armed.side,
+                entry: armed.entry,
+                sl: armed.sl,
+                tp: armed.tp,
+              });
+            }
+          }
+        }
+      }
+
+      const sizingAvail = safeLimitMode ? Math.max(0, available - reservedPendingMargin) : available;
+      const sized =
+        gateCheck.ok && sizingAvail > 0
+          ? sizePosition({
+              equity,
+              capitalPct,
+              entry: armed.entry,
+              sl: armed.sl,
+              leverage: lev,
+              usedMargin,
+              available: sizingAvail,
+              capitalBase,
+              minNotionalUsd: live ? 0 : PAPER_MIN_NOTIONAL_USD,
+              feeBps: PAPER_MAKER_BPS,
+            })
+          : null;
+
+      if (!gateCheck.ok || !sized) {
+        const previewSized = sizePosition({
+          equity: equity > 0 ? equity : Number(settings.equity_usd) || 10000,
+          capitalPct,
+          entry: armed.entry,
+          sl: armed.sl,
+          leverage: lev,
+          usedMargin: 0,
+          available: equity > 0 ? equity : Number(settings.equity_usd) || 10000,
+          capitalBase,
+          minNotionalUsd: live ? 0 : PAPER_MIN_NOTIONAL_USD,
+          feeBps: PAPER_MAKER_BPS,
+        });
+        await stageInBotWatch(armed, lev, previewSized);
+        continue;
+      }
+
+      const ttlBars = resolveSmartLimitTtlBars(armed.timeframe, settings.limit_ttl_bars, armed.ftcWait);
 
       if (live && adapter) {
         if (!hasLiveKeys(settings, venue)) continue;
@@ -1749,7 +2315,10 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           const liveLast = await fetchVenueLastPrice(venue, armed.symbol);
           if (Number.isFinite(liveLast) && liveLast > 0) {
             const slBreachedNow = armed.side === "long" ? liveLast <= armed.sl : liveLast >= armed.sl;
-            if (slBreachedNow) continue;
+            if (slBreachedNow) {
+              if (armed.existingWatchId) await cancelLimitOrder(armed.existingWatchId, "sl engulfed").catch(() => undefined);
+              continue;
+            }
           }
         } catch {
           /* proceed */
@@ -1849,6 +2418,9 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             });
             pendingCoins.delete(coin);
             if (posId) {
+              if (armed.existingWatchId) {
+                await markLimitOrderFilled(armed.existingWatchId, { exchangeOrderId: placedOrderId ?? null }).catch(() => undefined);
+              }
               openCount += 1;
               opened += 1;
               if (isHtfTf(armed.timeframe)) htfOpen += 1;
@@ -1899,34 +2471,67 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           continue;
         }
 
-        const saved = await insertLimitOrder({
-          mode: "live",
-          venue,
-          symbol: armed.symbol,
-          timeframe: armed.timeframe,
-          indicator: armed.indicator,
-          side: armed.side,
-          entry: armed.entry,
-          sl: armed.sl,
-          tp: armed.tp,
-          rr: armed.rr,
-          atr: armed.atr,
-          beAtR: trexBeAtR(armed.indicator),
-          qty: sized.qty,
-          leverage: lev,
-          notionalUsd: sized.notional,
-          riskUsd: sized.risk,
-          marginUsd: sized.margin,
-          armedBarTime: armed.armedBarTime,
-          ftcWait: armed.ftcWait,
-          maxWaitBars: ttlBars,
-          reason: armed.reason,
-          exchangeOrderId: placedOrderId ?? null,
-        });
-        if (saved.created) {
+        let placedId = 0;
+        let createdOrPromoted = false;
+        if (armed.existingWatchId) {
+          createdOrPromoted = await promoteWatchLimitOrder(armed.existingWatchId, {
+            entry: armed.entry,
+            sl: armed.sl,
+            tp: armed.tp,
+            rr: armed.rr,
+            atr: armed.atr,
+            qty: sized.qty,
+            leverage: lev,
+            notionalUsd: sized.notional,
+            riskUsd: sized.risk,
+            marginUsd: sized.margin,
+            maxWaitBars: ttlBars,
+            reason: armed.reason,
+            distanceAtr: armed.distanceAtr,
+            exchangeOrderId: placedOrderId ?? null,
+          });
+          placedId = armed.existingWatchId;
+        } else {
+          const saved = await insertLimitOrder({
+            mode: "live",
+            venue,
+            symbol: armed.symbol,
+            timeframe: armed.timeframe,
+            indicator: armed.indicator,
+            side: armed.side,
+            entry: armed.entry,
+            sl: armed.sl,
+            tp: armed.tp,
+            rr: armed.rr,
+            atr: armed.atr,
+            beAtR: trexBeAtR(armed.indicator),
+            qty: sized.qty,
+            leverage: lev,
+            notionalUsd: sized.notional,
+            riskUsd: sized.risk,
+            marginUsd: sized.margin,
+            armedBarTime: armed.armedBarTime,
+            ftcWait: armed.ftcWait,
+            maxWaitBars: ttlBars,
+            reason: armed.reason,
+            exchangeOrderId: placedOrderId ?? null,
+            distanceAtr: armed.distanceAtr,
+          });
+          createdOrPromoted = saved.created;
+          placedId = saved.id;
+        }
+        if (createdOrPromoted) {
           pendingCount += 1;
           if (isHtfTf(armed.timeframe)) htfPendingCount += 1;
           reservedPendingMargin += sized.margin;
+          activeView.push({
+            id: placedId,
+            symbol: armed.symbol,
+            coin,
+            timeframe: armed.timeframe,
+            phase: armed.phase,
+            distanceAtr: armed.distanceAtr,
+          });
           pendingTelegram.push({
             symbol: armed.symbol,
             timeframe: armed.timeframe,
@@ -1947,34 +2552,66 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         continue;
       }
 
-      const saved = await insertLimitOrder({
-        mode: "paper",
-        venue: "paper",
-        symbol: armed.symbol,
-        timeframe: armed.timeframe,
-        indicator: armed.indicator,
-        side: armed.side,
-        entry: armed.entry,
-        sl: armed.sl,
-        tp: armed.tp,
-        rr: armed.rr,
-        atr: armed.atr,
-        beAtR: trexBeAtR(armed.indicator),
-        qty: sized.qty,
-        leverage: lev,
-        notionalUsd: sized.notional,
-        riskUsd: sized.risk,
-        marginUsd: sized.margin,
-        armedBarTime: armed.armedBarTime,
-        ftcWait: armed.ftcWait,
-        maxWaitBars: ttlBars,
-        reason: armed.reason,
-      });
-      if (saved.created) {
+      let paperPlacedId = 0;
+      let paperCreatedOrPromoted = false;
+      if (armed.existingWatchId) {
+        paperCreatedOrPromoted = await promoteWatchLimitOrder(armed.existingWatchId, {
+          entry: armed.entry,
+          sl: armed.sl,
+          tp: armed.tp,
+          rr: armed.rr,
+          atr: armed.atr,
+          qty: sized.qty,
+          leverage: lev,
+          notionalUsd: sized.notional,
+          riskUsd: sized.risk,
+          marginUsd: sized.margin,
+          maxWaitBars: ttlBars,
+          reason: armed.reason,
+          distanceAtr: armed.distanceAtr,
+        });
+        paperPlacedId = armed.existingWatchId;
+      } else {
+        const saved = await insertLimitOrder({
+          mode: "paper",
+          venue: "paper",
+          symbol: armed.symbol,
+          timeframe: armed.timeframe,
+          indicator: armed.indicator,
+          side: armed.side,
+          entry: armed.entry,
+          sl: armed.sl,
+          tp: armed.tp,
+          rr: armed.rr,
+          atr: armed.atr,
+          beAtR: trexBeAtR(armed.indicator),
+          qty: sized.qty,
+          leverage: lev,
+          notionalUsd: sized.notional,
+          riskUsd: sized.risk,
+          marginUsd: sized.margin,
+          armedBarTime: armed.armedBarTime,
+          ftcWait: armed.ftcWait,
+          maxWaitBars: ttlBars,
+          reason: armed.reason,
+          distanceAtr: armed.distanceAtr,
+        });
+        paperCreatedOrPromoted = saved.created;
+        paperPlacedId = saved.id;
+      }
+      if (paperCreatedOrPromoted) {
         pendingCoins.add(coin);
         pendingCount += 1;
         if (isHtfTf(armed.timeframe)) htfPendingCount += 1;
         reservedPendingMargin += sized.margin;
+        activeView.push({
+          id: paperPlacedId,
+          symbol: armed.symbol,
+          coin,
+          timeframe: armed.timeframe,
+          phase: armed.phase,
+          distanceAtr: armed.distanceAtr,
+        });
         pendingTelegram.push({
           symbol: armed.symbol,
           timeframe: armed.timeframe,
@@ -1991,6 +2628,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         });
       }
     }
+    await trimWatchQueueExcess(MAX_WATCH_QUEUE_SIZE).catch(() => undefined);
   }
 
   for (const s of found) {

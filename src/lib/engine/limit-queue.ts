@@ -5,6 +5,7 @@ import {
   preArmMatchesOrder,
   type PreArmedSetup,
 } from "./pre-arm.ts";
+import { resolveEffectiveQueueCap } from "./smart-queue.ts";
 import { TF_MS, type ArmedSetup, type Bar, type IndicatorName, type Side, type Timeframe } from "./types.ts";
 
 export type EntryMode = "limit" | "market";
@@ -19,7 +20,8 @@ export type LimitCancelReason =
   | "gate muted"
   | "duplicate symbol"
   | "venue cancelled"
-  | "operator cancelled";
+  | "operator cancelled"
+  | "replaced by faster setup";
 
 export function parseEntryMode(raw: unknown): EntryMode {
   return String(raw ?? "").trim().toLowerCase() === "market" ? "market" : "limit";
@@ -49,6 +51,7 @@ export function canQueueLimitOrder(opts: {
   safeLimitMode: boolean;
   maxPositions: unknown;
   htfMaxPositions: unknown;
+  maxLimitQueue?: unknown;
   timeframe: Timeframe;
   coin: string;
   heldCoins: Set<string>;
@@ -75,6 +78,18 @@ export function canQueueLimitOrder(opts: {
 
   if (opts.safeLimitMode && opts.openCount + opts.pendingCount >= maxPos) {
     return { ok: false, reason: "safe limit cap reached" };
+  }
+
+  if (!opts.safeLimitMode && opts.maxLimitQueue !== undefined) {
+    const queueCap = resolveEffectiveQueueCap({
+      safeLimitMode: false,
+      maxPositions: opts.maxPositions,
+      openCount: opts.openCount,
+      maxLimitQueue: opts.maxLimitQueue,
+    });
+    if (opts.pendingCount >= queueCap) {
+      return { ok: false, reason: "queue cap reached" };
+    }
   }
 
   const htfMax = clampHtfMaxPositions(opts.htfMaxPositions);

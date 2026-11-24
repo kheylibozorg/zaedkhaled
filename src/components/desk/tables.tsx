@@ -104,7 +104,15 @@ export function PositionsTable({
                   <td className={win ? "px-3 py-2.5 text-long" : "px-3 py-2.5 text-short"}>
                     {r.status === "closed" && usd != null ? fmtUsd(usd) : "—"}
                   </td>
-                  <td className="px-3 py-2.5 text-muted">{r.status === "closed" ? r.exit_reason || "—" : "—"}</td>
+                  <td className="px-3 py-2.5 text-muted">
+                    {r.status === "closed"
+                      ? r.exit_reason === "excess trim"
+                        ? locale === "fa"
+                          ? "بستن مازاد"
+                          : "excess trim"
+                        : r.exit_reason || "—"
+                      : "—"}
+                  </td>
                   <td className="px-3 py-2.5 text-subtle">{timeAgo(r.opened_at, locale)}</td>
                 </tr>
               );
@@ -210,6 +218,7 @@ export function limitCancelLabel(reason: string | null | undefined, fa: boolean)
   if (r === "duplicate symbol") return fa ? "تکرار نماد" : "duplicate symbol";
   if (r === "venue cancelled") return fa ? "لغو در صرافی" : "venue cancelled";
   if (r === "operator cancelled") return fa ? "لغو دستی" : "operator cancelled";
+  if (r === "replaced by faster setup") return fa ? "جایگزین با فرصت سریع‌تر" : "replaced by faster setup";
   return r;
 }
 
@@ -235,6 +244,7 @@ export function LimitOrdersTable({
     status: string;
     cancel_reason?: string | null;
     reason?: string | null;
+    distance_atr?: number | null;
     created_at: string;
   }>;
   empty: string;
@@ -247,7 +257,7 @@ export function LimitOrdersTable({
   if (!rows.length) return <p className="px-1 py-6 text-sm text-muted">{empty}</p>;
   return (
     <div className="min-w-0 overflow-x-auto">
-      <table className="w-full min-w-[700px] text-start text-sm">
+      <table className="w-full min-w-[740px] text-start text-sm">
         <thead className="text-xs text-subtle">
           <tr className="border-b border-border">
             <th className="px-3 py-2 font-medium">Symbol</th>
@@ -257,6 +267,7 @@ export function LimitOrdersTable({
             <th className="px-3 py-2 font-medium">{fa ? "لیمیت ورود" : "Limit"}</th>
             <th className="px-3 py-2 font-medium">SL</th>
             <th className="px-3 py-2 font-medium">TP</th>
+            <th className="px-3 py-2 font-medium">{fa ? "فاصله" : "Dist"}</th>
             <th className="px-3 py-2 font-medium">TTL</th>
             <th className="px-3 py-2 font-medium">{fa ? "وضعیت" : "Status"}</th>
             <th className="px-3 py-2 font-medium">When</th>
@@ -266,8 +277,10 @@ export function LimitOrdersTable({
         <tbody className="font-mono tabular">
           {rows.map((r) => {
             const isPending = r.status === "pending";
+            const isWatch = r.status === "watch";
             const isFilled = r.status === "filled";
             const isPreArm = typeof r.reason === "string" && /pre-arm/i.test(r.reason);
+            const dist = r.distance_atr != null && Number.isFinite(Number(r.distance_atr)) ? Number(r.distance_atr) : null;
             return (
               <tr key={r.id} className="border-b border-border/60">
                 <td className="px-3 py-2.5 text-fg">{r.symbol.replace("USDT", "")}</td>
@@ -286,10 +299,13 @@ export function LimitOrdersTable({
                 <td className="px-3 py-2.5">{fmtPx(Number(r.entry))}</td>
                 <td className="px-3 py-2.5 text-short">{fmtPx(Number(r.sl))}</td>
                 <td className="px-3 py-2.5 text-long">{fmtPx(Number(r.tp))}</td>
+                <td className="px-3 py-2.5 text-muted">{dist != null ? `${dist.toFixed(2)} ATR` : "—"}</td>
                 <td className="px-3 py-2.5 text-muted">{r.max_wait_bars}b</td>
                 <td className="px-3 py-2.5">
                   {isPending ? (
                     <Badge tone="warn">{t.limitStatusPending}</Badge>
+                  ) : isWatch ? (
+                    <Badge tone="fg">{t.limitStatusWatch}</Badge>
                   ) : isFilled ? (
                     <Badge tone="long">{t.limitStatusFilled}</Badge>
                   ) : (
@@ -299,7 +315,7 @@ export function LimitOrdersTable({
                 <td className="px-3 py-2.5 text-subtle">{timeAgo(r.created_at, locale)}</td>
                 {onCancel ? (
                   <td className="px-3 py-2.5 text-end">
-                    {isPending ? (
+                    {isPending || isWatch ? (
                       <button
                         type="button"
                         disabled={!unlocked || cancellingId === r.id}

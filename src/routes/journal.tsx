@@ -49,6 +49,7 @@ function reasonLabel(reason: string, fa: boolean) {
   if (reason === "tp") return fa ? "تارگت" : "Target";
   if (reason === "be") return fa ? "ورود (BE)" : "Break-even";
   if (reason === "venue") return fa ? "صرافی" : "Venue";
+  if (reason === "excess trim") return fa ? "بستن مازاد" : "Excess trim";
   return reason || "—";
 }
 
