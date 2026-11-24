@@ -8,10 +8,15 @@ import {
 
 export const ENGINE_TFS: Timeframe[] = ["5m", "15m", "1h", "4h"];
 export const ENGINE_SIDES: Side[] = ["long", "short"];
+export type EntryPhase = "pre-arm" | "armed";
+export const ENGINE_PHASES: EntryPhase[] = ["pre-arm", "armed"];
+export type EntryPhaseMode = "both" | "pre_arm" | "armed";
+export type MarginMode = "cross" | "isolated";
 
 export type EngineGates = Partial<Record<IndicatorName, Partial<Record<Timeframe, boolean>>>>;
 export type SideGates = Partial<Record<IndicatorName, Partial<Record<Side, boolean>>>>;
 export type TfSideGates = Partial<Record<IndicatorName, Partial<Record<Timeframe, Partial<Record<Side, boolean>>>>>>;
+export type PhaseGates = Partial<Record<IndicatorName, Partial<Record<EntryPhase, boolean>>>>;
 
 export const ENGINE_FAMILIES: { id: string; label: string; names: IndicatorName[] }[] = [
   { id: "apex", label: "APEX", names: ["APEX1", "APEX15", "APEX2"] },
@@ -25,6 +30,19 @@ const NAME_SET = new Set<string>(ALL_INDICATORS);
 const TF_SET = new Set<string>(ENGINE_TFS);
 const SIDES_KEY = "_sides";
 const TF_SIDES_KEY = "_tfSides";
+const PHASES_KEY = "_phases";
+
+export function parseEntryPhaseMode(raw: unknown): EntryPhaseMode {
+  const s = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (s === "pre_arm" || s === "pre-arm") return "pre_arm";
+  if (s === "armed") return "armed";
+  return "both";
+}
+
+export function parseMarginMode(raw: unknown): MarginMode {
+  const s = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  return s === "isolated" ? "isolated" : "cross";
+}
 
 function parseGatesJson(raw: unknown): Record<string, unknown> | null {
   let obj: unknown = raw;
@@ -46,7 +64,7 @@ export function parseEngineGates(raw: unknown): EngineGates {
   if (!obj) return {};
   const out: EngineGates = {};
   for (const [name, row] of Object.entries(obj)) {
-    if (name === SIDES_KEY || name === TF_SIDES_KEY) continue;
+    if (name === SIDES_KEY || name === TF_SIDES_KEY || name === PHASES_KEY) continue;
     if (!NAME_SET.has(name) || !row || typeof row !== "object" || Array.isArray(row)) continue;
     const next: Partial<Record<Timeframe, boolean>> = {};
     for (const [tf, v] of Object.entries(row as Record<string, unknown>)) {
@@ -99,6 +117,24 @@ export function parseTfSideGates(raw: unknown): TfSideGates {
   return out;
 }
 
+export function parsePhaseGates(raw: unknown): PhaseGates {
+  const obj = parseGatesJson(raw);
+  if (!obj) return {};
+  const block = obj[PHASES_KEY];
+  if (!block || typeof block !== "object" || Array.isArray(block)) return {};
+  const out: PhaseGates = {};
+  for (const [name, row] of Object.entries(block as Record<string, unknown>)) {
+    if (!NAME_SET.has(name) || !row || typeof row !== "object" || Array.isArray(row)) continue;
+    const next: Partial<Record<EntryPhase, boolean>> = {};
+    for (const [phase, v] of Object.entries(row as Record<string, unknown>)) {
+      if ((phase !== "pre-arm" && phase !== "armed") || typeof v !== "boolean") continue;
+      next[phase] = v;
+    }
+    if (Object.keys(next).length) out[name as IndicatorName] = next;
+  }
+  return out;
+}
+
 /** Missing cell = on. Only explicit false mutes that engine on that TF. */
 export function isEngineOn(gates: EngineGates, name: IndicatorName, tf: Timeframe): boolean {
   return gates[name]?.[tf] !== false;
@@ -121,6 +157,23 @@ export function isSideOn(
   return true;
 }
 
+/** Missing cell = on. Only explicit false mutes pre-arm or armed FTC for that engine. */
+export function isPhaseOn(phases: PhaseGates, name: string, phase: EntryPhase): boolean {
+  if (!NAME_SET.has(name)) return true;
+  return phases[name as IndicatorName]?.[phase] !== false;
+}
+
+export function isEntryPhaseAllowed(
+  entryPhaseMode: EntryPhaseMode,
+  phases: PhaseGates,
+  name: string,
+  phase: EntryPhase,
+): boolean {
+  if (entryPhaseMode === "pre_arm" && phase !== "pre-arm") return false;
+  if (entryPhaseMode === "armed" && phase !== "armed") return false;
+  return isPhaseOn(phases, name, phase);
+}
+
 export function setEngineGate(
   gates: EngineGates,
   name: IndicatorName,
@@ -137,6 +190,13 @@ export function setSideGate(sides: SideGates, name: IndicatorName, side: Side, o
   return {
     ...sides,
     [name]: { ...(sides[name] ?? {}), [side]: on },
+  };
+}
+
+export function setPhaseGate(phases: PhaseGates, name: IndicatorName, phase: EntryPhase, on: boolean): PhaseGates {
+  return {
+    ...phases,
+    [name]: { ...(phases[name] ?? {}), [phase]: on },
   };
 }
 
@@ -206,6 +266,12 @@ export function setAllSides(sides: SideGates, side: Side, on: boolean): SideGate
   return next;
 }
 
+export function setAllPhases(phases: PhaseGates, phase: EntryPhase, on: boolean): PhaseGates {
+  let next = phases;
+  for (const name of ALL_INDICATORS) next = setPhaseGate(next, name, phase, on);
+  return next;
+}
+
 export function countArmed(gates: EngineGates): { on: number; total: number } {
   const total = ALL_INDICATORS.length * ENGINE_TFS.length;
   let on = 0;
@@ -226,6 +292,17 @@ export function countSidesArmed(sides: SideGates): { longOn: number; shortOn: nu
   return { longOn, shortOn, total };
 }
 
+export function countPhasesArmed(phases: PhaseGates): { preArmOn: number; armedOn: number; total: number } {
+  const total = ALL_INDICATORS.length;
+  let preArmOn = 0;
+  let armedOn = 0;
+  for (const name of ALL_INDICATORS) {
+    if (isPhaseOn(phases, name, "pre-arm")) preArmOn += 1;
+    if (isPhaseOn(phases, name, "armed")) armedOn += 1;
+  }
+  return { preArmOn, armedOn, total };
+}
+
 /** SCAN_RULE order, minus muted cells. Empty object = every engine stays on. */
 export function scanNames(tf: Timeframe, gates: EngineGates): IndicatorName[] {
   return SCAN_RULE[tf].filter((name) => isEngineOn(gates, name, tf));
@@ -235,6 +312,7 @@ export function serializeEngineGates(
   gates: EngineGates,
   sides: SideGates = {},
   tfSides: TfSideGates = {},
+  phases: PhaseGates = {},
 ): string {
   const compact: Record<string, unknown> = {};
   for (const name of ALL_INDICATORS) {
@@ -267,6 +345,16 @@ export function serializeEngineGates(
     }
   }
   if (Object.keys(tfSideCompact).length) compact[TF_SIDES_KEY] = tfSideCompact;
+
+  const phaseCompact: PhaseGates = {};
+  for (const name of ALL_INDICATORS) {
+    for (const phase of ENGINE_PHASES) {
+      if (isPhaseOn(phases, name, phase)) continue;
+      phaseCompact[name] = phaseCompact[name] ?? {};
+      phaseCompact[name]![phase] = false;
+    }
+  }
+  if (Object.keys(phaseCompact).length) compact[PHASES_KEY] = phaseCompact;
 
   return JSON.stringify(compact);
 }

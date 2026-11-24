@@ -2,7 +2,19 @@ import { fetchKlinesCached } from "@/lib/market/klines";
 import { FALLBACK_UNIVERSE, fetchUniverse, fetchVenueUniverse, filterByMinCap, minCapUsd, looksLikeFallbackUniverse } from "@/lib/market/universe";
 import { fetchVenueLastPrice } from "@/lib/market/venues";
 import { onlyClosedBars, runIndicator, scanArmedClosed, scanBarClosed, type ArmedSetup } from "@/lib/engine/run";
-import { parseEngineGates, parseSideGates, parseTfSideGates, scanNames, isEngineOn, isSideOn } from "@/lib/engine/engine-gates";
+import {
+  parseEngineGates,
+  parseEntryPhaseMode,
+  parseMarginMode,
+  parsePhaseGates,
+  parseSideGates,
+  parseTfSideGates,
+  scanNames,
+  isEngineOn,
+  isEntryPhaseAllowed,
+  isSideOn,
+  type EntryPhase,
+} from "@/lib/engine/engine-gates";
 import {
   PAPER_MAKER_BPS,
   PAPER_MIN_NOTIONAL_USD,
@@ -12,6 +24,9 @@ import {
   estimatePaperFundingUsd,
   exitPathBars,
   origStopPx,
+  paperAvailableUsd,
+  paperCrossCollateralUsd,
+  paperPositionUpl,
   paperSlippageBps,
   pathExcursion,
   rebaseStopsFromFill,
@@ -222,7 +237,37 @@ export async function overlayLiveSnapshot<
 >(settings: T, open: PositionRow[]): Promise<{ settings: T; open: PositionRow[] }> {
   const venue = bookVenue(settings.venue);
   if (settings.mode !== "live" || venue === "paper") {
-    return { settings: attachAvailable(settings, open), open };
+    if (!open.length) return { settings: attachAvailable(settings, open), open };
+    const syms = [...new Set(open.map((p) => p.symbol))];
+    const marks = new Map<string, number>();
+    await mapPool(syms, 4, async (sym) => {
+      try {
+        const bars = await withTimeout(fetchKlinesCached(sym, "5m", 6, venue), 2500);
+        const closed = onlyClosedBars(bars, "5m");
+        const last = closed.length ? closed[closed.length - 1] : bars[bars.length - 1];
+        const px = Number(last?.close);
+        if (Number.isFinite(px) && px > 0) marks.set(sym, px);
+      } catch {
+        /* keep entry price */
+      }
+    });
+    let totalUpl = 0;
+    const mapped = open.map((p) => {
+      const mark = marks.get(p.symbol);
+      if (mark == null) return p;
+      const side = p.side === "short" ? ("short" as const) : ("long" as const);
+      const upl = paperPositionUpl(side, Number(p.entry), Number(p.qty), mark);
+      totalUpl += upl;
+      return { ...p, pnl_usd: upl };
+    });
+    const used = usedMarginUsd(mapped);
+    return {
+      settings: {
+        ...settings,
+        availableUsd: paperAvailableUsd(settings.equityUsd, used, totalUpl),
+      },
+      open: mapped,
+    };
   }
   const row = await getSettings().catch(() => null);
   if (!row || !hasLiveKeys(row, venue)) return { settings: attachAvailable(settings, open), open };
@@ -576,9 +621,42 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     }
   });
 
+  const marginMode = parseMarginMode(settings.margin_mode);
+  const entryPhaseMode = parseEntryPhaseMode(settings.entry_phase_mode);
+  const phaseGates = parsePhaseGates(settings.engine_gates);
+
+  function closedMarkPrice(sym: string): number | null {
+    const raw = lastBars.get(sym);
+    if (!raw?.length) return null;
+    const bars5 = onlyClosedBars(raw, "5m");
+    const last = bars5.length ? bars5[bars5.length - 1] : raw[raw.length - 1];
+    const px = Number(last?.close);
+    return Number.isFinite(px) && px > 0 ? px : null;
+  }
+
+  function openPaperStats(rows: PositionRow[]) {
+    return rows
+      .filter((p) => p.mode !== "live")
+      .map((p) => {
+        const entry = Number(p.entry);
+        const qty = Number(p.qty);
+        const notionalUsd = Number(p.notional_usd) || qty * entry;
+        const mark = closedMarkPrice(p.symbol) ?? entry;
+        const side = p.side === "short" ? ("short" as const) : ("long" as const);
+        return {
+          id: p.id,
+          notionalUsd,
+          upl: paperPositionUpl(side, entry, qty, mark),
+        };
+      });
+  }
+
+  const openPaperItemsAtStart = openPaperStats(open);
+  const startPaperUpl = openPaperItemsAtStart.reduce((a, x) => a + x.upl, 0);
+
   let equity = Number(settings.equity_usd);
   let usedMargin = usedMarginUsd(open);
-  let available = Math.max(0, equity - usedMargin);
+  let available = paperAvailableUsd(equity, usedMargin, startPaperUpl);
   const wantLive = settings.mode === "live" && venue !== "paper";
   const live =
     wantLive &&
@@ -760,6 +838,14 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       isLimitFill,
     });
     if (!path.length) continue;
+    const posNotional = Number(pos.notional_usd) || Number(pos.qty) * entry;
+    const crossCollateralUsd =
+      !livePos && marginMode === "cross"
+        ? paperCrossCollateralUsd({
+            equity,
+            otherPositions: openPaperItemsAtStart.filter((x) => x.id !== pos.id),
+          })
+        : undefined;
     const walked = walkPath({
       side,
       entry,
@@ -768,6 +854,9 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       bars: path,
       beAtR: trexBeAtR(pos.indicator),
       leverage: !livePos ? Number(pos.leverage) || 1 : undefined,
+      marginMode: !livePos ? marginMode : undefined,
+      notionalUsd: !livePos ? posNotional : undefined,
+      crossCollateralUsd,
     });
     if (walked.beMoved && Math.abs(walked.sl - slNow) > 1e-12) {
       const atEntry = Math.abs(walked.sl - entry) <= 1e-8 * Math.max(1, entry);
@@ -1052,7 +1141,8 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   }
   usedMargin = usedMarginUsd(stillOpen);
   if (!walletAfterClose) {
-    available = Math.max(0, equity - usedMargin);
+    const openUpl = openPaperStats(stillOpen).reduce((a, x) => a + x.upl, 0);
+    available = paperAvailableUsd(equity, usedMargin, openUpl);
   }
 
   const nowMs = Date.now();
@@ -1379,9 +1469,11 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             currentPreArmed = undefined;
           }
         }
+        const originPhase: EntryPhase = preArmOrder ? "pre-arm" : "armed";
         const gateMuted =
           !isEngineOn(engineGates, o.indicator as IndicatorName, tf) ||
-          !isSideOn(sideGates, o.indicator, side, tf, tfSideGates);
+          !isSideOn(sideGates, o.indicator, side, tf, tfSideGates) ||
+          !isEntryPhaseAllowed(entryPhaseMode, phaseGates, o.indicator, originPhase);
         const evalRes = evaluatePendingLimit({
           order: {
             symbol: o.symbol,
@@ -1430,9 +1522,9 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             await cancelLimitOrder(o.id, "htf cap reached");
             continue;
           }
-          if (available <= 0) {
+          if (available <= 0 || fillMargin > available + 1e-6) {
             resolvedPendingIds.add(o.id);
-            await cancelLimitOrder(o.id, "max positions reached");
+            await cancelLimitOrder(o.id, "insufficient margin");
             continue;
           }
           const fillNotional = Number(o.notional_usd) || Number(o.qty) * evalRes.fillPrice;
@@ -1582,9 +1674,11 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           currentPreArmed = undefined;
         }
       }
+      const originPhase: EntryPhase = preArmOrder ? "pre-arm" : "armed";
       const gateMuted =
         !isEngineOn(engineGates, w.indicator as IndicatorName, tf) ||
-        !isSideOn(sideGates, w.indicator, side, tf, tfSideGates);
+        !isSideOn(sideGates, w.indicator, side, tf, tfSideGates) ||
+        !isEntryPhaseAllowed(entryPhaseMode, phaseGates, w.indicator, originPhase);
       const evalRes = evaluatePendingLimit({
         order: {
           symbol: w.symbol,
@@ -1689,6 +1783,10 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       const capBaseB = parseCapitalBase(settings.capital_base);
       const tiersB = parseLevSizeTiers(settings.lev_size_tiers);
       for (const cand of rankedWatch) {
+        const candPhase: EntryPhase = cand.phase === "pre-arm" ? "pre-arm" : "armed";
+        if (!isEntryPhaseAllowed(entryPhaseMode, phaseGates, cand.indicator, candPhase)) {
+          continue;
+        }
         if (shouldStageInWatchQueue({ timeframe: cand.timeframe, phase: cand.phase, distanceAtr: cand.distanceAtr })) {
           continue;
         }
@@ -1753,6 +1851,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
               entry: cand.entry,
               sl: cand.sl,
               tp: cand.tp,
+              marginMode,
             });
             if (!lmtRes.ok || lmtRes.filled) continue;
             if (cand.existingWatchId) {
@@ -1781,6 +1880,18 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             continue;
           }
         } else if (cand.existingWatchId) {
+          try {
+            const paperLast = await withTimeout(fetchVenueLastPrice(venue, cand.symbol), 3000);
+            if (Number.isFinite(paperLast) && paperLast > 0) {
+              const slBreachedNow = cand.side === "long" ? paperLast <= cand.sl : paperLast >= cand.sl;
+              if (slBreachedNow) {
+                await cancelLimitOrder(cand.existingWatchId, "sl engulfed");
+                continue;
+              }
+            }
+          } catch {
+            /* keep closed-bar guard */
+          }
           const promoted = await promoteWatchLimitOrder(cand.existingWatchId, {
             entry: cand.entry,
             sl: cand.sl,
@@ -1940,6 +2051,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         const armedIndHere = new Set<string>();
         for (const a of armedList) {
           armedIndHere.add(a.indicator);
+          if (!isEntryPhaseAllowed(entryPhaseMode, phaseGates, a.indicator, "armed")) continue;
           const key = `${asset.symbol}|${tf}|${a.indicator}|${a.armedBarTime}`;
           if (seenArmed.has(key)) continue;
           seenArmed.add(key);
@@ -1952,6 +2064,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         }
         for (const pre of preArmedList) {
           if (armedIndHere.has(pre.indicator)) continue;
+          if (!isEntryPhaseAllowed(entryPhaseMode, phaseGates, pre.indicator, "pre-arm")) continue;
           const key = `${asset.symbol}|${tf}|${pre.indicator}|${pre.armedBarTime}`;
           if (seenArmed.has(key)) continue;
           seenArmed.add(key);
@@ -2153,6 +2266,8 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
 
     for (const armed of rankedCandidates) {
       const coin = armed.coin;
+      const candPhase: EntryPhase = armed.phase === "pre-arm" ? "pre-arm" : "armed";
+      if (!isEntryPhaseAllowed(entryPhaseMode, phaseGates, armed.indicator, candPhase)) continue;
       if (!isSideOn(sideGates, armed.indicator, armed.side, armed.timeframe, tfSideGates)) continue;
       if (!isValidLimitGeometry(armed.side, armed.entry, armed.sl, armed.tp)) continue;
       if (held.has(coin) || pendingCoins.has(coin)) continue;
@@ -2341,6 +2456,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             entry: armed.entry,
             sl: armed.sl,
             tp: armed.tp,
+            marginMode,
           });
           if (!lmtRes.ok) {
             pendingCoins.delete(coin);
@@ -2556,6 +2672,19 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         continue;
       }
 
+      try {
+        const paperLast = await withTimeout(fetchVenueLastPrice(venue, armed.symbol), 3000);
+        if (Number.isFinite(paperLast) && paperLast > 0) {
+          const slBreachedNow = armed.side === "long" ? paperLast <= armed.sl : paperLast >= armed.sl;
+          if (slBreachedNow) {
+            if (armed.existingWatchId) await cancelLimitOrder(armed.existingWatchId, "sl engulfed").catch(() => undefined);
+            continue;
+          }
+        }
+      } catch {
+        /* keep closed-bar guard */
+      }
+
       let paperPlacedId = 0;
       let paperCreatedOrPromoted = false;
       if (armed.existingWatchId) {
@@ -2731,6 +2860,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
                 sl: s.sl,
                 tp: s.tp,
                 entry: s.entry,
+                marginMode,
               });
               if (res.fillPrice && res.fillPrice > 0) liveFillPx = res.fillPrice;
               if (res.filledQty && res.filledQty > 0) liveFillQty = res.filledQty;

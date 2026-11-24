@@ -40,18 +40,74 @@ export function applyPaperSlippage(
   return adverseUp ? price * (1 + mult) : price * (1 - mult);
 }
 
-/** Approximate perp liquidation price including maintenance margin rate. */
+export type PaperMarginMode = "cross" | "isolated";
+
+/** Mark-to-market unrealized PnL in USD before close fees. */
+export function paperPositionUpl(side: Side, entry: number, qty: number, markPrice: number): number {
+  if (!Number.isFinite(entry) || entry <= 0 || !Number.isFinite(qty) || qty <= 0 || !Number.isFinite(markPrice) || markPrice <= 0) {
+    return 0;
+  }
+  return side === "long" ? (markPrice - entry) * qty : (entry - markPrice) * qty;
+}
+
+/**
+ * Total collateral backing a single open position under Cross Margin:
+ * account equity + floating PnL of all OTHER open positions - maintenance margin reserved by OTHER positions.
+ */
+export function paperCrossCollateralUsd(opts: {
+  equity: number;
+  otherPositions: Array<{ notionalUsd: number; upl: number; mmr?: number }>;
+  defaultMmr?: number;
+}): number {
+  const eq = Math.max(0, Number(opts.equity) || 0);
+  const baseMmr = opts.defaultMmr ?? PAPER_DEFAULT_MMR;
+  let otherUpl = 0;
+  let otherMaint = 0;
+  for (const p of opts.otherPositions) {
+    otherUpl += Number.isFinite(p.upl) ? p.upl : 0;
+    otherMaint += Math.max(0, Number(p.notionalUsd) || 0) * Math.max(0, p.mmr ?? baseMmr);
+  }
+  return Math.max(0, eq + otherUpl - otherMaint);
+}
+
+/** Free cash available for new orders on paper wallet, accounting for floating drawdown like live exchanges. */
+export function paperAvailableUsd(equity: number, usedMargin: number, totalOpenUpl = 0): number {
+  const eq = Number(equity) || 0;
+  const used = Math.max(0, Number(usedMargin) || 0);
+  const drawdown = Math.min(0, Number(totalOpenUpl) || 0);
+  return Math.max(0, eq + drawdown - used);
+}
+
+/** Approximate perp liquidation price supporting both Cross (account-backed) and Isolated margin. */
 export function paperLiquidationPrice(
   side: Side,
   entry: number,
   leverage: number,
   mmr = PAPER_DEFAULT_MMR,
+  opts?: {
+    marginMode?: PaperMarginMode;
+    notionalUsd?: number;
+    crossCollateralUsd?: number;
+  },
 ): number {
   const lev = Number(leverage);
   if (!Number.isFinite(entry) || entry <= 0 || !Number.isFinite(lev) || lev <= 1) {
     return side === "long" ? 0 : Number.POSITIVE_INFINITY;
   }
-  const distFrac = Math.max(0.001, 1 / lev - Math.max(0, Math.min(0.05, mmr)));
+  const clampedMmr = Math.max(0, Math.min(0.05, mmr));
+  if (
+    opts?.marginMode === "cross" &&
+    opts.notionalUsd != null &&
+    Number.isFinite(opts.notionalUsd) &&
+    opts.notionalUsd > 0 &&
+    opts.crossCollateralUsd != null &&
+    Number.isFinite(opts.crossCollateralUsd)
+  ) {
+    const maintUsd = opts.notionalUsd * clampedMmr;
+    const distFrac = Math.max(0.001, (opts.crossCollateralUsd - maintUsd) / opts.notionalUsd);
+    return side === "long" ? Math.max(0, entry * (1 - distFrac)) : entry * (1 + distFrac);
+  }
+  const distFrac = Math.max(0.001, 1 / lev - clampedMmr);
   return side === "long" ? Math.max(0, entry * (1 - distFrac)) : entry * (1 + distFrac);
 }
 
@@ -246,13 +302,23 @@ export function walkPath(opts: {
   beAtR?: number | null;
   leverage?: number | null;
   mmr?: number;
+  marginMode?: PaperMarginMode;
+  notionalUsd?: number;
+  crossCollateralUsd?: number;
 }): { sl: number; beMoved: boolean; hit: PathHit | null; barsHeld: number } {
   let sl = opts.sl;
   const origSl = opts.sl;
   let beMoved = false;
   let i = 0;
   const lev = Number(opts.leverage ?? 0);
-  const liqPx = lev > 1 ? paperLiquidationPrice(opts.side, opts.entry, lev, opts.mmr) : null;
+  const liqPx =
+    lev > 1
+      ? paperLiquidationPrice(opts.side, opts.entry, lev, opts.mmr, {
+          marginMode: opts.marginMode,
+          notionalUsd: opts.notionalUsd,
+          crossCollateralUsd: opts.crossCollateralUsd,
+        })
+      : null;
   for (const bar of opts.bars) {
     i += 1;
     if (liqPx != null) {

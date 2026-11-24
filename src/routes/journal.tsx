@@ -4,12 +4,13 @@ import { Area, AreaChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "rec
 import { BookOpen, Download, RotateCcw } from "lucide-react";
 import { DeskShell } from "@/components/desk/shell";
 import { StatusChip } from "@/components/desk/status-chip";
-import { Kpi, PositionsTable, SideBadge } from "@/components/desk/tables";
+import { Kpi, PositionsTable, SideBadge, EntryOriginBadge } from "@/components/desk/tables";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input, Label, Select, Textarea } from "@/components/ui/field";
 import {
   analyzeJournal,
+  entryOriginOf,
   filterJournal,
   journalOptions,
   tradesToCsv,
@@ -71,6 +72,7 @@ function Page() {
   const [side, setSide] = useState("all");
   const [reason, setReason] = useState("all");
   const [mode, setMode] = useState("all");
+  const [entryOrigin, setEntryOrigin] = useState("all");
   const [pickedId, setPickedId] = useState<number | null>(null);
   const [confirm, setConfirm] = useState<null | "closed" | "paper">(null);
   const [busy, setBusy] = useState(false);
@@ -80,8 +82,8 @@ function Page() {
   const open = data.open as JournalTrade[];
   const opts = useMemo(() => journalOptions(closed), [closed]);
   const filtered = useMemo(
-    () => filterJournal(closed, { symbol, indicator, timeframe, side, reason, mode }),
-    [closed, symbol, indicator, timeframe, side, reason, mode],
+    () => filterJournal(closed, { symbol, indicator, timeframe, side, reason, mode, entryOrigin }),
+    [closed, symbol, indicator, timeframe, side, reason, mode, entryOrigin],
   );
   const stats = useMemo(
     () => analyzeJournal(filtered, num(data.settings.startingEquityUsd, 10000)),
@@ -311,7 +313,7 @@ function Page() {
                   {t.showing} {filtered.length} {t.ofTrades}
                 </span>
               </div>
-              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
                 <div className="grid gap-1.5">
                   <Label htmlFor="j-sym">{t.symbol}</Label>
                   <Input
@@ -349,6 +351,15 @@ function Page() {
                     <option value="all">{t.all}</option>
                     <option value="long">{t.long}</option>
                     <option value="short">{t.short}</option>
+                  </Select>
+                </div>
+                <div className="grid gap-1.5">
+                  <Label>{t.entryOrigin}</Label>
+                  <Select value={entryOrigin} onChange={(e) => setEntryOrigin(e.target.value)}>
+                    <option value="all">{t.all}</option>
+                    <option value="pre_arm">{t.originPreArm}</option>
+                    <option value="armed_limit">{t.originArmedLimit}</option>
+                    <option value="market">{t.originMarket}</option>
                   </Select>
                 </div>
                 <div className="grid gap-1.5">
@@ -432,11 +443,17 @@ function Page() {
               </section>
             </div>
 
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
               {[
                 { title: t.byIndicator, rows: stats.byIndicator, label: (k: string) => indicatorLabel(k) },
                 { title: t.byTf, rows: stats.byTf, label: (k: string) => k },
                 { title: t.bySide, rows: stats.bySide, label: (k: string) => (k === "long" ? t.long : k === "short" ? t.short : k) },
+                {
+                  title: t.byEntryOrigin,
+                  rows: stats.byEntryOrigin,
+                  label: (k: string) =>
+                    k === "pre_arm" ? t.originPreArm : k === "armed_limit" ? t.originArmedLimit : t.originMarket,
+                },
                 { title: t.byExit, rows: stats.byReason, label: (k: string) => reasonLabel(k, fa) },
               ].map((block) => (
                 <section key={block.title} className="rounded-lg border border-border bg-surface p-4 shadow-panel">
@@ -508,6 +525,7 @@ function BlotterTable({
               </div>
               <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted">
                 <SideBadge side={r.side} />
+                <EntryOriginBadge reason={r.signal_reason} />
                 <span>{r.timeframe}</span>
                 <span>{reasonLabel(r.exit_reason ?? "", fa)}</span>
                 <span className="font-mono">{fmtUsd(usd)}</span>
@@ -545,7 +563,10 @@ function BlotterTable({
                   )}
                 >
                   <td className="px-3 py-2.5">
-                    <div className="text-fg">{r.symbol.replace("USDT", "")}</div>
+                    <div className="flex flex-wrap items-center gap-1.5 text-fg">
+                      <span>{r.symbol.replace("USDT", "")}</span>
+                      <EntryOriginBadge reason={r.signal_reason} />
+                    </div>
                     <div className="text-xs text-subtle">
                       {r.timeframe} · {r.mode}
                     </div>
@@ -690,6 +711,13 @@ function TradeDetail({
       pairs: [
         [t.mode, row.mode === "live" ? t.live : t.paper],
         [t.venue, row.venue],
+        [
+          t.entryOrigin,
+          (() => {
+            const origin = entryOriginOf(row.signal_reason);
+            return origin === "pre_arm" ? t.originPreArm : origin === "armed_limit" ? t.originArmedLimit : t.originMarket;
+          })(),
+        ],
         [t.equityAtOpen, row.equity_at_open != null ? fmtUsd(num(row.equity_at_open), 0) : "—"],
         [t.candle, fmtBarOpen(row.bar_time)],
         [t.openedAt, fmtWhen(row.opened_at, locale)],
@@ -719,6 +747,7 @@ function TradeDetail({
         <span className="text-sm text-muted">{row.timeframe}</span>
         <Badge tone="muted">{indicatorLabel(row.indicator)}</Badge>
         <SideBadge side={row.side} />
+        <EntryOriginBadge reason={row.signal_reason} />
         {row.status === "closed" ? (
           <Badge tone={win ? "long" : "short"}>{win ? t.wins : t.losses}</Badge>
         ) : (

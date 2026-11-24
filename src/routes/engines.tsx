@@ -9,21 +9,28 @@ import {
   ENGINE_TFS,
   clearTfSideForSide,
   countArmed,
+  countPhasesArmed,
   countSidesArmed,
   isEngineOn,
+  isPhaseOn,
   isSideOn,
   parseEngineGates,
+  parsePhaseGates,
   parseSideGates,
   parseTfSideGates,
   serializeEngineGates,
   setAllEngines,
+  setAllPhases,
   setAllSides,
   setEngineCol,
   setEngineGate,
   setEngineRow,
+  setPhaseGate,
   setSideGate,
   setTfSideGate,
   type EngineGates,
+  type EntryPhase,
+  type PhaseGates,
   type SideGates,
   type TfSideGates,
 } from "@/lib/engine/engine-gates";
@@ -47,9 +54,11 @@ function Page() {
   const storedGates = useMemo(() => parseEngineGates(raw), [raw]);
   const storedSides = useMemo(() => parseSideGates(raw), [raw]);
   const storedTfSides = useMemo(() => parseTfSideGates(raw), [raw]);
+  const storedPhases = useMemo(() => parsePhaseGates(raw), [raw]);
   const [gates, setGates] = useState<EngineGates>(storedGates);
   const [sides, setSides] = useState<SideGates>(storedSides);
   const [tfSides, setTfSides] = useState<TfSideGates>(storedTfSides);
+  const [phases, setPhases] = useState<PhaseGates>(storedPhases);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -58,12 +67,15 @@ function Page() {
     setGates(storedGates);
     setSides(storedSides);
     setTfSides(storedTfSides);
-  }, [storedGates, storedSides, storedTfSides]);
+    setPhases(storedPhases);
+  }, [storedGates, storedSides, storedTfSides, storedPhases]);
 
   const armed = countArmed(gates);
   const sideArmed = countSidesArmed(sides);
+  const phaseArmed = countPhasesArmed(phases);
   const dirty =
-    serializeEngineGates(gates, sides, tfSides) !== serializeEngineGates(storedGates, storedSides, storedTfSides);
+    serializeEngineGates(gates, sides, tfSides, phases) !==
+    serializeEngineGates(storedGates, storedSides, storedTfSides, storedPhases);
 
   async function save() {
     if (!unlocked) return;
@@ -71,7 +83,7 @@ function Page() {
     setMsg(null);
     setErr(null);
     try {
-      await saveDeskSettings({ data: { engine_gates: serializeEngineGates(gates, sides, tfSides) } });
+      await saveDeskSettings({ data: { engine_gates: serializeEngineGates(gates, sides, tfSides, phases) } });
       setMsg(t.enginesSaved);
       await router.invalidate({ sync: true });
     } catch (e) {
@@ -137,8 +149,20 @@ function Page() {
     }
   }
 
+  function flipPhase(name: IndicatorName, phase: EntryPhase) {
+    if (!unlocked) return;
+    setPhases((p) => setPhaseGate(p, name, phase, !isPhaseOn(p, name, phase)));
+  }
+
+  function allPhase(phase: EntryPhase, on: boolean) {
+    if (!unlocked) return;
+    setPhases((p) => setAllPhases(p, phase, on));
+  }
+
   const longAllOn = sideArmed.longOn === sideArmed.total;
   const shortAllOn = sideArmed.shortOn === sideArmed.total;
+  const preArmAllOn = phaseArmed.preArmOn === phaseArmed.total;
+  const armedFtcAllOn = phaseArmed.armedOn === phaseArmed.total;
 
   return (
     <DeskShell>
@@ -161,6 +185,16 @@ function Page() {
               ? `${sideArmed.shortOn} از ${sideArmed.total} ${t.enginesShortArmed}`
               : `${sideArmed.shortOn} / ${sideArmed.total} ${t.enginesShortArmed}`}
           </Badge>
+          <Badge tone={preArmAllOn ? "warn" : phaseArmed.preArmOn === 0 ? "muted" : "fg"}>
+            {fa
+              ? `${phaseArmed.preArmOn} از ${phaseArmed.total} ${t.enginesPreArmStatus}`
+              : `${phaseArmed.preArmOn} / ${phaseArmed.total} ${t.enginesPreArmStatus}`}
+          </Badge>
+          <Badge tone={armedFtcAllOn ? "long" : phaseArmed.armedOn === 0 ? "muted" : "warn"}>
+            {fa
+              ? `${phaseArmed.armedOn} از ${phaseArmed.total} ${t.enginesArmedFtcStatus}`
+              : `${phaseArmed.armedOn} / ${phaseArmed.total} ${t.enginesArmedFtcStatus}`}
+          </Badge>
           <Button type="button" variant="outline" disabled={!unlocked || busy} onClick={() => setGates(setAllEngines(true))}>
             {t.enginesAllOn}
           </Button>
@@ -172,6 +206,12 @@ function Page() {
           </Button>
           <Button type="button" variant="outline" disabled={!unlocked || busy} onClick={() => allSide("short", !shortAllOn)}>
             {shortAllOn ? t.enginesAllShortOff : t.enginesAllShortOn}
+          </Button>
+          <Button type="button" variant="outline" disabled={!unlocked || busy} onClick={() => allPhase("pre-arm", !preArmAllOn)}>
+            {preArmAllOn ? t.enginesAllPreArmOff : t.enginesAllPreArmOn}
+          </Button>
+          <Button type="button" variant="outline" disabled={!unlocked || busy} onClick={() => allPhase("armed", !armedFtcAllOn)}>
+            {armedFtcAllOn ? t.enginesAllArmedOff : t.enginesAllArmedOn}
           </Button>
           <Button type="button" disabled={!unlocked || busy || !dirty} onClick={save}>
             {busy ? t.running : t.save}
@@ -188,7 +228,7 @@ function Page() {
       {err ? <p className="mt-3 text-sm text-short">{err}</p> : null}
 
       <div className="mt-6 overflow-x-auto rounded-lg border border-border bg-surface shadow-panel">
-        <table className="w-full min-w-[880px] text-sm">
+        <table className="w-full min-w-[1040px] text-sm">
           <thead className="text-xs text-subtle">
             <tr className="border-b border-border">
               <th className="px-3 py-2 text-start font-medium">{t.thInd}</th>
@@ -237,6 +277,32 @@ function Page() {
                   </button>
                 </div>
               </th>
+              <th className="px-2 py-2 text-center font-medium">
+                <div className="grid gap-1">
+                  <span>{t.phasePreArm}</span>
+                  <button
+                    type="button"
+                    disabled={!unlocked}
+                    onClick={() => allPhase("pre-arm", !preArmAllOn)}
+                    className="mx-auto text-[10px] text-muted hover:text-fg disabled:opacity-40"
+                  >
+                    {t.enginesCol}
+                  </button>
+                </div>
+              </th>
+              <th className="px-2 py-2 text-center font-medium">
+                <div className="grid gap-1">
+                  <span>{t.phaseArmedFtc}</span>
+                  <button
+                    type="button"
+                    disabled={!unlocked}
+                    onClick={() => allPhase("armed", !armedFtcAllOn)}
+                    className="mx-auto text-[10px] text-muted hover:text-fg disabled:opacity-40"
+                  >
+                    {t.enginesCol}
+                  </button>
+                </div>
+              </th>
               <th className="px-2 py-2 text-center font-medium">{t.enginesRow}</th>
             </tr>
           </thead>
@@ -248,17 +314,21 @@ function Page() {
                 gates={gates}
                 sides={sides}
                 tfSides={tfSides}
+                phases={phases}
                 unlocked={unlocked}
                 fa={fa}
                 rowOn={t.enginesOn}
                 rowOff={t.enginesOff}
                 longLabel={t.long}
                 shortLabel={t.short}
+                preArmLabel={t.phasePreArm}
+                armedFtcLabel={t.phaseArmedFtc}
                 rowLabel={t.enginesRow}
                 familyLabel={t.enginesFamily}
                 onFlip={flip}
                 onFlipSide={flipSide}
                 onFlipTfSide={flipTfSide}
+                onFlipPhase={flipPhase}
                 onRow={rowOn}
                 onFamily={familyOn}
               />
@@ -275,17 +345,21 @@ function FamilyBlock({
   gates,
   sides,
   tfSides,
+  phases,
   unlocked,
   fa,
   rowOn,
   rowOff,
   longLabel,
   shortLabel,
+  preArmLabel,
+  armedFtcLabel,
   rowLabel,
   familyLabel,
   onFlip,
   onFlipSide,
   onFlipTfSide,
+  onFlipPhase,
   onRow,
   onFamily,
 }: {
@@ -293,17 +367,21 @@ function FamilyBlock({
   gates: EngineGates;
   sides: SideGates;
   tfSides: TfSideGates;
+  phases: PhaseGates;
   unlocked: boolean;
   fa: boolean;
   rowOn: string;
   rowOff: string;
   longLabel: string;
   shortLabel: string;
+  preArmLabel: string;
+  armedFtcLabel: string;
   rowLabel: string;
   familyLabel: string;
   onFlip: (name: IndicatorName, tf: Timeframe) => void;
   onFlipSide: (name: IndicatorName, side: Side) => void;
   onFlipTfSide: (name: IndicatorName, tf: Timeframe, side: Side) => void;
+  onFlipPhase: (name: IndicatorName, phase: EntryPhase) => void;
   onRow: (name: IndicatorName, on: boolean) => void;
   onFamily: (names: IndicatorName[], on: boolean) => void;
 }) {
@@ -318,7 +396,7 @@ function FamilyBlock({
         <td className="px-3 py-2 font-medium" colSpan={1}>
           {family.label}
         </td>
-        <td className="px-2 py-2 text-center text-xs text-subtle" colSpan={ENGINE_TFS.length + 2}>
+        <td className="px-2 py-2 text-center text-xs text-subtle" colSpan={ENGINE_TFS.length + 4}>
           {fa ? `${familyOnCount} از ${familyTotal}` : `${familyOnCount} / ${familyTotal}`}
         </td>
         <td className="px-2 py-2 text-center">
@@ -337,6 +415,8 @@ function FamilyBlock({
         const rowCount = ENGINE_TFS.filter((tf) => isEngineOn(gates, name, tf)).length;
         const longOn = isSideOn(sides, name, "long");
         const shortOn = isSideOn(sides, name, "short");
+        const preArmOn = isPhaseOn(phases, name, "pre-arm");
+        const armedOn = isPhaseOn(phases, name, "armed");
         return (
           <tr key={name} className="border-t border-border/60">
             <td className="px-3 py-2.5">
@@ -432,6 +512,36 @@ function FamilyBlock({
                 )}
               >
                 {shortOn ? rowOn : rowOff}
+              </button>
+            </td>
+            <td className="px-2 py-2 text-center">
+              <button
+                type="button"
+                disabled={!unlocked}
+                aria-label={`${label} ${preArmLabel}`}
+                aria-pressed={preArmOn}
+                onClick={() => onFlipPhase(name, "pre-arm")}
+                className={cn(
+                  "inline-flex h-11 min-w-16 items-center justify-center rounded-sm border px-3 text-xs font-medium transition-colors disabled:opacity-40",
+                  preArmOn ? "border-accent/50 bg-surface-2 text-accent" : "border-border bg-surface-2 text-muted",
+                )}
+              >
+                {preArmOn ? rowOn : rowOff}
+              </button>
+            </td>
+            <td className="px-2 py-2 text-center">
+              <button
+                type="button"
+                disabled={!unlocked}
+                aria-label={`${label} ${armedFtcLabel}`}
+                aria-pressed={armedOn}
+                onClick={() => onFlipPhase(name, "armed")}
+                className={cn(
+                  "inline-flex h-11 min-w-16 items-center justify-center rounded-sm border px-3 text-xs font-medium transition-colors disabled:opacity-40",
+                  armedOn ? "border-long/40 bg-long-dim text-long" : "border-border bg-surface-2 text-muted",
+                )}
+              >
+                {armedOn ? rowOn : rowOff}
               </button>
             </td>
             <td className="px-2 py-2 text-center">

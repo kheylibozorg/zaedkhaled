@@ -17,6 +17,7 @@ export type PlaceOrderInput = {
   leverage: number;
   sl: number;
   tp: number;
+  marginMode?: "cross" | "isolated";
   reduceOnly?: boolean;
   /** Signal/paper entry. Used only to rebase SL/TP onto the live fill. */
   entry?: number;
@@ -99,6 +100,7 @@ export type PlaceLimitOrderInput = {
   entry: number;
   sl: number;
   tp: number;
+  marginMode?: "cross" | "isolated";
 };
 
 export type PlaceLimitOrderResult = {

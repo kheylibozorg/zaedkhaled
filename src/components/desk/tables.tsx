@@ -1,4 +1,5 @@
 import { Badge } from "@/components/ui/badge";
+import { entryOriginOf } from "@/lib/engine/journal";
 import { indicatorLabel } from "@/lib/engine/types";
 import { useLocale } from "@/lib/locale";
 import { cn } from "@/lib/utils";
@@ -11,6 +12,14 @@ function closedPnlUsd(r: { pnl_usd?: number | null; pnl_r?: number | null; risk_
   const risk = Number(r.risk_usd);
   if (Number.isFinite(mult) && Number.isFinite(risk) && risk > 0) return mult * risk;
   return null;
+}
+
+export function EntryOriginBadge({ reason }: { reason?: string | null }) {
+  const { t } = useLocale();
+  const origin = entryOriginOf(reason);
+  if (origin === "pre_arm") return <Badge tone="warn">{t.originPreArm}</Badge>;
+  if (origin === "armed_limit") return <Badge tone="fg">{t.originArmedLimit}</Badge>;
+  return <Badge tone="muted">{t.originMarket}</Badge>;
 }
 
 export function SideBadge({ side }: { side: string }) {
@@ -41,6 +50,7 @@ export function PositionsTable({
     pnl_usd?: number | null;
     risk_usd?: number | null;
     exit_reason?: string | null;
+    signal_reason?: string | null;
   }>;
   empty: string;
   onPick?: (id: number) => void;
@@ -76,7 +86,15 @@ export function PositionsTable({
           ) : (
             rows.map((r) => {
               const usd = closedPnlUsd(r);
-              const win = r.status !== "closed" || (usd != null ? usd >= 0 : Number(r.pnl_r) >= 0);
+              const openUpl = r.status !== "closed" && r.pnl_usd != null && Number.isFinite(Number(r.pnl_usd)) ? Number(r.pnl_usd) : null;
+              const win =
+                r.status === "closed"
+                  ? usd != null
+                    ? usd >= 0
+                    : Number(r.pnl_r) >= 0
+                  : openUpl != null
+                    ? openUpl >= 0
+                    : true;
               const active = pickedId === r.id;
               return (
                 <tr
@@ -90,7 +108,12 @@ export function PositionsTable({
                 >
                   <td className="px-3 py-2.5 text-fg">{r.symbol.replace("USDT", "")}</td>
                   <td className="px-3 py-2.5 text-muted">{r.timeframe}</td>
-                  <td className="px-3 py-2.5 text-muted">{indicatorLabel(r.indicator)}</td>
+                  <td className="px-3 py-2.5 text-muted">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span>{indicatorLabel(r.indicator)}</span>
+                      <EntryOriginBadge reason={r.signal_reason} />
+                    </div>
+                  </td>
                   <td className="px-3 py-2.5">
                     <SideBadge side={r.side} />
                   </td>
@@ -102,7 +125,11 @@ export function PositionsTable({
                     {r.status === "closed" ? fmtR(Number(r.pnl_r)) : "—"}
                   </td>
                   <td className={win ? "px-3 py-2.5 text-long" : "px-3 py-2.5 text-short"}>
-                    {r.status === "closed" && usd != null ? fmtUsd(usd) : "—"}
+                    {r.status === "closed" && usd != null
+                      ? fmtUsd(usd)
+                      : openUpl != null
+                        ? fmtUsd(openUpl)
+                        : "—"}
                   </td>
                   <td className="px-3 py-2.5 text-muted">
                     {r.status === "closed"
@@ -219,6 +246,7 @@ export function limitCancelLabel(reason: string | null | undefined, fa: boolean)
   if (r === "venue cancelled") return fa ? "لغو در صرافی" : "venue cancelled";
   if (r === "operator cancelled") return fa ? "لغو دستی" : "operator cancelled";
   if (r === "replaced by faster setup") return fa ? "جایگزین با فرصت سریع‌تر" : "replaced by faster setup";
+  if (r === "insufficient margin") return fa ? "کمبود مارجین آزاد" : "insufficient margin";
   return r;
 }
 

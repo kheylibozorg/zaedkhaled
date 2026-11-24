@@ -346,15 +346,16 @@ async function setHlLeverage(
   exchange: ReturnType<typeof clients>["exchange"],
   assetIdx: number,
   leverage: number,
+  isCross = true,
 ) {
   try {
-    await exchange.updateLeverage({ asset: assetIdx, isCross: true, leverage });
+    await exchange.updateLeverage({ asset: assetIdx, isCross, leverage });
     return;
   } catch {
-    /* some markets / isolated-only configs reject cross; try isolated */
+    /* some markets / configs only support the other margin mode */
   }
   try {
-    await exchange.updateLeverage({ asset: assetIdx, isCross: false, leverage });
+    await exchange.updateLeverage({ asset: assetIdx, isCross: !isCross, leverage });
   } catch {
     /* already set on venue */
   }
@@ -444,7 +445,7 @@ export const hyperliquidAdapter: ExchangeAdapter = {
       }
       const lev = capLeverage(Math.min(order.leverage, hit.asset.maxLeverage || order.leverage));
       const { exchange } = clients(account);
-      await setHlLeverage(exchange, hit.idx, lev);
+      await setHlLeverage(exchange, hit.idx, lev, order.marginMode !== "isolated");
       const slPx = formatPrice(order.sl, szDec);
       const tpPx = formatPrice(order.tp, szDec);
       const closeBuy = !isBuy;
@@ -575,7 +576,7 @@ export const hyperliquidAdapter: ExchangeAdapter = {
       }
       const lev = capLeverage(Math.min(order.leverage, hit.asset.maxLeverage || order.leverage));
       const { exchange } = clients(account);
-      await setHlLeverage(exchange, hit.idx, lev);
+      await setHlLeverage(exchange, hit.idx, lev, order.marginMode !== "isolated");
       const slPx = formatPrice(order.sl, szDec);
       const tpPx = formatPrice(order.tp, szDec);
       const closeBuy = !isBuy;

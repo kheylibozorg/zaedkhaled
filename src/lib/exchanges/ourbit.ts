@@ -601,12 +601,14 @@ export const ourbitAdapter: ExchangeAdapter = {
       }
       const lev = capLeverage(Math.min(order.leverage, spec.maxLeverage || order.leverage));
       const long = order.side === "long";
-      let acceptedOpenType = 2;
+      const preferredOpenType = order.marginMode === "isolated" ? 1 : 2;
+      const fallbackOpenType = preferredOpenType === 2 ? 1 : 2;
+      let acceptedOpenType = preferredOpenType;
       try {
         await signed(account, "POST", "/api/v1/private/position/change_leverage", {
           symbol: spec.symbol,
           leverage: lev,
-          openType: 2,
+          openType: preferredOpenType,
           positionType: long ? 1 : 2,
         });
       } catch {
@@ -614,10 +616,10 @@ export const ourbitAdapter: ExchangeAdapter = {
           await signed(account, "POST", "/api/v1/private/position/change_leverage", {
             symbol: spec.symbol,
             leverage: lev,
-            openType: 1,
+            openType: fallbackOpenType,
             positionType: long ? 1 : 2,
           });
-          acceptedOpenType = 1;
+          acceptedOpenType = fallbackOpenType;
         } catch {
           /* leverage may already be set */
         }
@@ -638,8 +640,8 @@ export const ourbitAdapter: ExchangeAdapter = {
           data = await sendOrder(acceptedOpenType);
         } catch (firstErr) {
           const msg = firstErr instanceof Error ? firstErr.message : "";
-          if (acceptedOpenType === 2 && /open\s?type|isolated|cross|margin\s?mode|position\s?mode/i.test(msg)) {
-            data = await sendOrder(1);
+          if (/open\s?type|isolated|cross|margin\s?mode|position\s?mode/i.test(msg)) {
+            data = await sendOrder(acceptedOpenType === 2 ? 1 : 2);
           } else {
             throw firstErr;
           }
@@ -728,12 +730,14 @@ export const ourbitAdapter: ExchangeAdapter = {
       const limitPx = roundPrice(order.entry, spec.priceUnit);
       const slPx = roundPrice(order.sl, spec.priceUnit);
       const tpPx = roundPrice(order.tp, spec.priceUnit);
-      let acceptedOpenType = 2;
+      const preferredOpenType = order.marginMode === "isolated" ? 1 : 2;
+      const fallbackOpenType = preferredOpenType === 2 ? 1 : 2;
+      let acceptedOpenType = preferredOpenType;
       try {
         await signed(account, "POST", "/api/v1/private/position/change_leverage", {
           symbol: spec.symbol,
           leverage: lev,
-          openType: 2,
+          openType: preferredOpenType,
           positionType: long ? 1 : 2,
         });
       } catch {
@@ -741,10 +745,10 @@ export const ourbitAdapter: ExchangeAdapter = {
           await signed(account, "POST", "/api/v1/private/position/change_leverage", {
             symbol: spec.symbol,
             leverage: lev,
-            openType: 1,
+            openType: fallbackOpenType,
             positionType: long ? 1 : 2,
           });
-          acceptedOpenType = 1;
+          acceptedOpenType = fallbackOpenType;
         } catch {
           /* leverage may already be set */
         }
@@ -769,8 +773,8 @@ export const ourbitAdapter: ExchangeAdapter = {
         data = await sendLimit(acceptedOpenType);
       } catch (firstErr) {
         const msg = firstErr instanceof Error ? firstErr.message : "";
-        if (acceptedOpenType === 2 && /open\s?type|isolated|cross|margin\s?mode|position\s?mode/i.test(msg)) {
-          data = await sendLimit(1);
+        if (/open\s?type|isolated|cross|margin\s?mode|position\s?mode/i.test(msg)) {
+          data = await sendLimit(acceptedOpenType === 2 ? 1 : 2);
         } else {
           throw firstErr;
         }

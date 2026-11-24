@@ -43,6 +43,12 @@ function Home() {
   const [tiers, setTiers] = useState(s.levSizeTiers ?? DEFAULT_LEV_SIZE_TIERS);
   const [minCap, setMinCap] = useState(String(usdToMillions(s.minMarketCapUsd)));
   const [entryMode, setEntryMode] = useState<"limit" | "market">(s.entryMode === "market" ? "market" : "limit");
+  const [entryPhaseMode, setEntryPhaseMode] = useState<"both" | "pre_arm" | "armed">(
+    s.entryPhaseMode === "pre_arm" ? "pre_arm" : s.entryPhaseMode === "armed" ? "armed" : "both",
+  );
+  const [marginMode, setMarginMode] = useState<"cross" | "isolated">(
+    s.marginMode === "isolated" ? "isolated" : "cross",
+  );
   const [safeLimitMode, setSafeLimitMode] = useState<boolean>(s.safeLimitMode ?? true);
   const [limitTtlBars, setLimitTtlBars] = useState(String(s.limitTtlBars ?? 0));
   const [maxLimitQueue, setMaxLimitQueue] = useState(String(s.maxLimitQueue ?? 8));
@@ -65,11 +71,13 @@ function Home() {
     setTiers(s.levSizeTiers ?? DEFAULT_LEV_SIZE_TIERS);
     setMinCap(String(usdToMillions(s.minMarketCapUsd)));
     setEntryMode(s.entryMode === "market" ? "market" : "limit");
+    setEntryPhaseMode(s.entryPhaseMode === "pre_arm" ? "pre_arm" : s.entryPhaseMode === "armed" ? "armed" : "both");
+    setMarginMode(s.marginMode === "isolated" ? "isolated" : "cross");
     setSafeLimitMode(s.safeLimitMode ?? true);
     setLimitTtlBars(String(s.limitTtlBars ?? 0));
     setMaxLimitQueue(String(s.maxLimitQueue ?? 8));
     setAutoTrimExcess(s.autoTrimExcess ?? false);
-  }, [s.capitalPct, s.capitalBase, s.scanBatch, s.maxPositions, s.htfMaxPositions, s.minLeverage, s.maxLeverage, s.stackLevCount, s.stackLevCap, s.levSizeTiers, s.minMarketCapUsd, s.entryMode, s.safeLimitMode, s.limitTtlBars, s.maxLimitQueue, s.autoTrimExcess]);
+  }, [s.capitalPct, s.capitalBase, s.scanBatch, s.maxPositions, s.htfMaxPositions, s.minLeverage, s.maxLeverage, s.stackLevCount, s.stackLevCap, s.levSizeTiers, s.minMarketCapUsd, s.entryMode, s.entryPhaseMode, s.marginMode, s.safeLimitMode, s.limitTtlBars, s.maxLimitQueue, s.autoTrimExcess]);
   const pnl = Number(data.stats.pnl);
   const curve = data.equity.map((e) => ({
     t: new Date(e.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
@@ -98,6 +106,8 @@ function Home() {
           lev_size_tiers: tiers,
           min_market_cap_usd: millionsToUsd(Number(minCap) || 0),
           entry_mode: entryMode,
+          entry_phase_mode: entryPhaseMode,
+          margin_mode: marginMode,
           safe_limit_mode: safeLimitMode ? 1 : 0,
           limit_ttl_bars: Math.min(48, Math.max(0, Math.round(Number(limitTtlBars) || 0))),
           max_limit_queue: Math.min(40, Math.max(0, Math.round(Number(maxLimitQueue) || 0))),
@@ -116,6 +126,10 @@ function Home() {
       setTiers(saved.levSizeTiers ?? tiers);
       setMinCap(String(usdToMillions(saved.minMarketCapUsd)));
       setEntryMode(saved.entryMode === "market" ? "market" : "limit");
+      setEntryPhaseMode(
+        saved.entryPhaseMode === "pre_arm" ? "pre_arm" : saved.entryPhaseMode === "armed" ? "armed" : "both",
+      );
+      setMarginMode(saved.marginMode === "isolated" ? "isolated" : "cross");
       setSafeLimitMode(saved.safeLimitMode ?? true);
       setLimitTtlBars(String(saved.limitTtlBars ?? 0));
       setMaxLimitQueue(String(saved.maxLimitQueue ?? 8));
@@ -702,6 +716,54 @@ function Home() {
               <p className="text-xs text-subtle">{t.entryModeHint}</p>
             </div>
             <div className="grid gap-1.5">
+              <Label>{t.entryPhaseMode}</Label>
+              <div className="grid grid-cols-3 gap-1.5">
+                {(
+                  [
+                    { id: "both", label: t.entryPhaseBoth },
+                    { id: "pre_arm", label: t.entryPhasePreArm },
+                    { id: "armed", label: t.entryPhaseArmed },
+                  ] as const
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    disabled={!unlocked || saving}
+                    onClick={() => setEntryPhaseMode(opt.id)}
+                    className={`min-h-10 rounded-sm border px-2 text-xs ${
+                      entryPhaseMode === opt.id
+                        ? "border-accent bg-surface-2 text-fg"
+                        : "border-border text-muted hover:border-border-strong"
+                    } disabled:opacity-40`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-subtle">{t.entryPhaseHint}</p>
+            </div>
+            <div className="grid gap-1.5">
+              <Label>{t.marginMode}</Label>
+              <div className="grid grid-cols-2 gap-1.5">
+                {(["cross", "isolated"] as const).map((mm) => (
+                  <button
+                    key={mm}
+                    type="button"
+                    disabled={!unlocked || saving}
+                    onClick={() => setMarginMode(mm)}
+                    className={`min-h-10 rounded-sm border px-2 text-xs ${
+                      marginMode === mm
+                        ? "border-accent bg-surface-2 text-fg"
+                        : "border-border text-muted hover:border-border-strong"
+                    } disabled:opacity-40`}
+                  >
+                    {mm === "cross" ? t.marginModeCross : t.marginModeIsolated}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-subtle">{t.marginModeHint}</p>
+            </div>
+            <div className="grid gap-1.5">
               <Label>{t.safeLimitMode}</Label>
               <div className="grid grid-cols-2 gap-1.5">
                 {([true, false] as const).map((on) => (
@@ -833,6 +895,9 @@ function Home() {
             {locale === "fa"
               ? ` ${(s.minLeverage ?? 1) > 1 ? `محدوده اهرم ${s.minLeverage}x تا ${s.maxLeverage ?? 200}x (ارزهای زیر ${s.minLeverage}x هم با سقف خودشان باز می‌شوند)` : `سقف اهرم ${s.maxLeverage ?? 200}x`} — بالاتر از سقف خود ارز نمی‌رود.${Number(s.stackLevCount) > 0 ? (s.minLeverage ?? 1) > 1 ? ` اگر ${s.stackLevCount} معامله در محدوده ${s.minLeverage}–${s.maxLeverage ?? 200}x همزمان باز باشد سقف بعدی می‌شود ${s.stackLevCap}x.` : ` اگر ${s.stackLevCount} معامله با اهرم >${s.stackLevCap}x همزمان باز باشد سقف می‌شود ${s.stackLevCap}x.` : ""}`
               : ` ${(s.minLeverage ?? 1) > 1 ? `Leverage range ${s.minLeverage}x–${s.maxLeverage ?? 200}x (below-${s.minLeverage}x coins still enter at their own max)` : `Leverage cap ${s.maxLeverage ?? 200}x`} — never above that coin's venue max.${Number(s.stackLevCount) > 0 ? (s.minLeverage ?? 1) > 1 ? ` After ${s.stackLevCount} concurrent opens in ${s.minLeverage}–${s.maxLeverage ?? 200}x, the cap becomes ${s.stackLevCap}x.` : ` After ${s.stackLevCount} concurrent opens above ${s.stackLevCap}x, the cap becomes ${s.stackLevCap}x.` : ""}`}
+            {locale === "fa"
+              ? ` مارجین: ${s.marginMode === "isolated" ? "ایزوله" : "کراس"} · ورود لیمیت: ${s.entryPhaseMode === "pre_arm" ? "فقط Pre-Arm" : s.entryPhaseMode === "armed" ? "فقط بعد آرم" : "هر دو"}.`
+              : ` Margin: ${s.marginMode === "isolated" ? "Isolated" : "Cross"} · Limit filter: ${s.entryPhaseMode === "pre_arm" ? "Pre-Arm only" : s.entryPhaseMode === "armed" ? "Armed FTC only" : "Both"}.`}
             {!unlocked
               ? locale === "fa"
                 ? " · برای ذخیره، از صرافی‌ها پین را باز کن."

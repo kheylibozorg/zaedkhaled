@@ -12,7 +12,10 @@ import {
   exitPathBars,
   liveFillReverted,
   netClosePnl,
+  paperAvailableUsd,
+  paperCrossCollateralUsd,
   paperLiquidationPrice,
+  paperPositionUpl,
   paperSlippageBps,
   pathExcursion,
   rebaseStopsFromFill,
@@ -421,5 +424,58 @@ describe("paper-live parity — slippage, min-notional, liquidation & HTF limit 
       monitored.map((b) => b.time),
       [b2.time],
     );
+  });
+
+  it("uses account collateral under cross margin so high-leverage trades hit SL instead of false isolated liq", () => {
+    const isoLiq = paperLiquidationPrice("long", 100, 100);
+    assert.ok(isoLiq > 99 && isoLiq < 99.6);
+
+    const crossCollat = paperCrossCollateralUsd({ equity: 10_000, otherPositions: [] });
+    const crossLiq = paperLiquidationPrice("long", 100, 100, undefined, {
+      marginMode: "cross",
+      notionalUsd: 30_000,
+      crossCollateralUsd: crossCollat,
+    });
+    assert.ok(crossLiq < 70);
+
+    // Price dips 1.5% to SL (98.5) — cross exits cleanly at SL; isolated would have liquidated at ~99.5
+    const crossWalk = walkPath({
+      side: "long",
+      entry: 100,
+      sl: 98.5,
+      tp: 103,
+      leverage: 100,
+      marginMode: "cross",
+      notionalUsd: 30_000,
+      crossCollateralUsd: crossCollat,
+      bars: [bar(0, { high: 100.2, low: 98.4, close: 98.5 })],
+    });
+    assert.equal(crossWalk.hit?.reason, "sl");
+    assert.equal(crossWalk.hit?.liquidated, undefined);
+    assert.equal(crossWalk.hit?.exit, 98.5);
+
+    const isoWalk = walkPath({
+      side: "long",
+      entry: 100,
+      sl: 98.5,
+      tp: 103,
+      leverage: 100,
+      marginMode: "isolated",
+      bars: [bar(0, { high: 100.2, low: 98.4, close: 98.5 })],
+    });
+    assert.equal(isoWalk.hit?.liquidated, true);
+    assert.equal(isoWalk.hit?.exit, isoLiq);
+  });
+
+  it("tracks unrealized PnL in cross collateral and loss-adjusted available margin", () => {
+    const upl = paperPositionUpl("long", 100, 10, 95);
+    assert.equal(upl, -50);
+    assert.equal(paperAvailableUsd(1000, 200, -50), 750);
+    assert.equal(paperAvailableUsd(1000, 200, 100), 800);
+    const collat = paperCrossCollateralUsd({
+      equity: 1000,
+      otherPositions: [{ notionalUsd: 5000, upl: -200 }],
+    });
+    assert.equal(collat, 775);
   });
 });

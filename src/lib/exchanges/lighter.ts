@@ -529,10 +529,11 @@ export const lighterAdapter: ExchangeAdapter = {
       const sl = scaleLighterInt(order.sl, mkt.priceDecimals);
       const tp = scaleLighterInt(order.tp, mkt.priceDecimals);
       const isAsk = order.side === "short";
+      const marginMode = order.marginMode === "isolated" ? 1 : 0;
       const hash = await withSigner(account, async (client) => {
         await getLighterAuth(account, client);
         try {
-          await client.updateLeverage(mkt.marketIndex, 0, capLeverage(Math.min(order.leverage, mkt.maxLeverage)));
+          await client.updateLeverage(mkt.marketIndex, marginMode, capLeverage(Math.min(order.leverage, mkt.maxLeverage)));
         } catch {
           /* already set */
         }
@@ -675,10 +676,11 @@ export const lighterAdapter: ExchangeAdapter = {
       const sl = scaleLighterInt(order.sl, mkt.priceDecimals);
       const tp = scaleLighterInt(order.tp, mkt.priceDecimals);
       const isAsk = order.side === "short";
+      const marginMode = order.marginMode === "isolated" ? 1 : 0;
       const hash = await withSigner(account, async (client) => {
         await getLighterAuth(account, client);
         try {
-          await client.updateLeverage(mkt.marketIndex, 0, capLeverage(Math.min(order.leverage, mkt.maxLeverage)));
+          await client.updateLeverage(mkt.marketIndex, marginMode, capLeverage(Math.min(order.leverage, mkt.maxLeverage)));
         } catch {
           /* already set */
         }

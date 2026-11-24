@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { analyzeJournal, filterJournal, tradesToCsv, type JournalTrade } from "./journal.ts";
+import { analyzeJournal, entryOriginOf, filterJournal, tradesToCsv, type JournalTrade } from "./journal.ts";
 
 function trade(p: Partial<JournalTrade> & { id: number }): JournalTrade {
   return {
@@ -65,10 +65,11 @@ describe("analyzeJournal", () => {
     assert.equal(s.byReason.find((b) => b.key === "tp")?.n, 2);
   });
 
-  it("filterJournal slices by indicator, symbol and mode", () => {
+  it("filterJournal slices by indicator, symbol, mode, and entryOrigin", () => {
     const rows = [
-      trade({ id: 1, symbol: "ETHUSDT", indicator: "HALC", mode: "paper" }),
-      trade({ id: 2, symbol: "BTCUSDT", indicator: "APEX1", mode: "live" }),
+      trade({ id: 1, symbol: "ETHUSDT", indicator: "HALC", mode: "paper", signal_reason: "Pre-arm FTC limit · FTC limit fill" }),
+      trade({ id: 2, symbol: "BTCUSDT", indicator: "APEX1", mode: "live", signal_reason: "APEX 1R FTC long · FTC limit fill" }),
+      trade({ id: 3, symbol: "SOLUSDT", indicator: "TREX1", mode: "paper", signal_reason: "TREX 1.0R long · bar close" }),
     ];
     const eth = filterJournal(rows, { symbol: "eth" });
     assert.equal(eth.length, 1);
@@ -79,13 +80,25 @@ describe("analyzeJournal", () => {
     const live = filterJournal(rows, { mode: "live" });
     assert.equal(live.length, 1);
     assert.equal(live[0]?.id, 2);
+    assert.equal(entryOriginOf(rows[0]!.signal_reason), "pre_arm");
+    assert.equal(entryOriginOf(rows[1]!.signal_reason), "armed_limit");
+    assert.equal(entryOriginOf(rows[2]!.signal_reason), "market");
+    assert.equal(filterJournal(rows, { entryOrigin: "pre_arm" }).length, 1);
+    assert.equal(filterJournal(rows, { entryOrigin: "armed_limit" }).length, 1);
+    assert.equal(filterJournal(rows, { entryOrigin: "market" }).length, 1);
+    const stats = analyzeJournal(rows, 1000);
+    assert.equal(stats.byEntryOrigin.find((b) => b.key === "pre_arm")?.n, 1);
+    assert.equal(stats.byEntryOrigin.find((b) => b.key === "armed_limit")?.n, 1);
+    assert.equal(stats.byEntryOrigin.find((b) => b.key === "market")?.n, 1);
   });
 
-  it("tradesToCsv includes blotter columns and a BOM", () => {
-    const csv = tradesToCsv([trade({ id: 9, signal_reason: "FTC tag, second test", notes: "held through wick" })]);
+  it("tradesToCsv includes blotter columns, entry_origin, and a BOM", () => {
+    const csv = tradesToCsv([trade({ id: 9, signal_reason: "Pre-arm FTC tag, second test", notes: "held through wick" })]);
     assert.ok(csv.startsWith("\uFEFF"));
+    assert.ok(csv.includes("entry_origin"));
+    assert.ok(csv.includes("pre_arm"));
     assert.ok(csv.includes("signal_reason"));
-    assert.ok(csv.includes("FTC tag, second test"));
+    assert.ok(csv.includes("Pre-arm FTC tag, second test"));
     assert.ok(csv.includes("notes"));
     assert.ok(csv.includes("held through wick"));
   });

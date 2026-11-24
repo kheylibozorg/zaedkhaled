@@ -3,19 +3,27 @@ import { describe, it } from "node:test";
 import {
   clearTfSideForSide,
   countArmed,
+  countPhasesArmed,
   countSidesArmed,
   isEngineOn,
+  isEntryPhaseAllowed,
+  isPhaseOn,
   isSideOn,
   parseEngineGates,
+  parseEntryPhaseMode,
+  parseMarginMode,
+  parsePhaseGates,
   parseSideGates,
   parseTfSideGates,
   scanNames,
   serializeEngineGates,
   setAllEngines,
+  setAllPhases,
   setAllSides,
   setEngineCol,
   setEngineGate,
   setEngineRow,
+  setPhaseGate,
   setSideGate,
   setTfSideGate,
 } from "./engine-gates.ts";
@@ -153,5 +161,44 @@ describe("engine gates", () => {
     assert.equal(isSideOn({}, "APEX1", "short", "15m", junk), false);
     assert.equal(isSideOn({}, "APEX1", "long", "15m", junk), true);
     assert.equal(isSideOn({}, "NOPE", "short", "15m", junk), true);
+  });
+
+  it("parses entry_phase_mode and margin_mode with safe defaults", () => {
+    assert.equal(parseEntryPhaseMode(null), "both");
+    assert.equal(parseEntryPhaseMode("pre_arm"), "pre_arm");
+    assert.equal(parseEntryPhaseMode("pre-arm"), "pre_arm");
+    assert.equal(parseEntryPhaseMode("armed"), "armed");
+    assert.equal(parseEntryPhaseMode("other"), "both");
+
+    assert.equal(parseMarginMode(null), "cross");
+    assert.equal(parseMarginMode("cross"), "cross");
+    assert.equal(parseMarginMode("isolated"), "isolated");
+    assert.equal(parseMarginMode("weird"), "cross");
+  });
+
+  it("supports per-engine pre-arm & armed FTC phase gates + global phase mode", () => {
+    assert.equal(countPhasesArmed({}).preArmOn, 11);
+    assert.equal(countPhasesArmed({}).armedOn, 11);
+    assert.equal(isPhaseOn({}, "APEX1", "pre-arm"), true);
+    assert.equal(isPhaseOn({}, "APEX1", "armed"), true);
+
+    const phases = setPhaseGate(setAllPhases({}, "pre-arm", false), "APEX1", "pre-arm", true);
+    assert.equal(isPhaseOn(phases, "APEX1", "pre-arm"), true);
+    assert.equal(isPhaseOn(phases, "APEX2", "pre-arm"), false);
+    assert.equal(isPhaseOn(phases, "APEX2", "armed"), true);
+
+    assert.equal(isEntryPhaseAllowed("both", phases, "APEX1", "pre-arm"), true);
+    assert.equal(isEntryPhaseAllowed("both", phases, "APEX2", "pre-arm"), false);
+    assert.equal(isEntryPhaseAllowed("armed", phases, "APEX1", "pre-arm"), false);
+    assert.equal(isEntryPhaseAllowed("armed", phases, "APEX2", "armed"), true);
+    assert.equal(isEntryPhaseAllowed("pre_arm", phases, "APEX1", "armed"), false);
+    assert.equal(isEntryPhaseAllowed("pre_arm", phases, "APEX1", "pre-arm"), true);
+
+    const raw = serializeEngineGates({}, {}, {}, phases);
+    assert.equal(raw.includes("true"), false);
+    const reparsed = parsePhaseGates(raw);
+    assert.equal(isPhaseOn(reparsed, "APEX1", "pre-arm"), true);
+    assert.equal(isPhaseOn(reparsed, "APEX2", "pre-arm"), false);
+    assert.equal(isPhaseOn(reparsed, "APEX2", "armed"), true);
   });
 });

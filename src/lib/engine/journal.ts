@@ -50,6 +50,15 @@ export type JournalHistBar = { key: string; lo: number; hi: number; n: number };
 
 export type JournalPoint = { t: number; r: number; usd: number };
 
+export type EntryOrigin = "pre_arm" | "armed_limit" | "market";
+
+export function entryOriginOf(signalReason?: string | null): EntryOrigin {
+  const r = typeof signalReason === "string" ? signalReason : "";
+  if (/pre-arm/i.test(r)) return "pre_arm";
+  if (/limit/i.test(r)) return "armed_limit";
+  return "market";
+}
+
 export type JournalStats = {
   n: number;
   wins: number;
@@ -78,6 +87,7 @@ export type JournalStats = {
   byTf: JournalBucket[];
   bySide: JournalBucket[];
   byReason: JournalBucket[];
+  byEntryOrigin: JournalBucket[];
   hist: JournalHistBar[];
   curve: JournalPoint[];
 };
@@ -182,11 +192,13 @@ export function analyzeJournal(rows: JournalTrade[], startEquity = 0): JournalSt
   const byTf = new Map<string, JournalBucket>();
   const bySide = new Map<string, JournalBucket>();
   const byReason = new Map<string, JournalBucket>();
+  const byEntryOrigin = new Map<string, JournalBucket>();
   for (const row of closed) {
     pushBucket(byIndicator, row.indicator || "—", row);
     pushBucket(byTf, row.timeframe || "—", row);
     pushBucket(bySide, row.side || "—", row);
     pushBucket(byReason, row.exit_reason || "—", row);
+    pushBucket(byEntryOrigin, entryOriginOf(row.signal_reason), row);
   }
 
   const hist = HIST.map((h) => ({ ...h, n: 0 }));
@@ -226,6 +238,7 @@ export function analyzeJournal(rows: JournalTrade[], startEquity = 0): JournalSt
     byTf: sortedBuckets(byTf),
     bySide: sortedBuckets(bySide),
     byReason: sortedBuckets(byReason),
+    byEntryOrigin: sortedBuckets(byEntryOrigin),
     hist,
     curve,
   };
@@ -240,6 +253,7 @@ export function filterJournal(
     side?: string;
     reason?: string;
     mode?: string;
+    entryOrigin?: string;
   },
 ) {
   const sym = (q.symbol ?? "").trim().toUpperCase();
@@ -252,6 +266,7 @@ export function filterJournal(
     if (q.side && q.side !== "all" && r.side !== q.side) return false;
     if (q.reason && q.reason !== "all" && (r.exit_reason ?? "") !== q.reason) return false;
     if (q.mode && q.mode !== "all" && r.mode !== q.mode) return false;
+    if (q.entryOrigin && q.entryOrigin !== "all" && entryOriginOf(r.signal_reason) !== q.entryOrigin) return false;
     return true;
   });
 }
@@ -276,6 +291,7 @@ export function tradesToCsv(rows: JournalTrade[]) {
     "timeframe",
     "indicator",
     "side",
+    "entry_origin",
     "entry",
     "orig_sl",
     "sl",
@@ -311,7 +327,11 @@ export function tradesToCsv(rows: JournalTrade[]) {
   };
   const lines = [cols.join(",")];
   for (const r of rows) {
-    lines.push(cols.map((c) => esc(r[c])).join(","));
+    lines.push(
+      cols
+        .map((c) => esc(c === "entry_origin" ? entryOriginOf(r.signal_reason) : r[c]))
+        .join(","),
+    );
   }
   return `\uFEFF${lines.join("\n")}`;
 }

@@ -1,5 +1,6 @@
 import { getDbSource, getSql, isServerlessRuntime } from "@/lib/db";
 import { DEMO_JOURNAL } from "@/lib/engine/demo-journal";
+import { parseEntryPhaseMode, parseMarginMode } from "@/lib/engine/engine-gates";
 import { DEFAULT_CAPITAL_PCT, parseCapitalBase, parseLevSizeTiers } from "@/lib/engine/lev-size";
 import { clampLimitTtlBars, parseEntryMode } from "@/lib/engine/limit-queue";
 import { clampMaxLimitQueue } from "@/lib/engine/smart-queue";
@@ -63,6 +64,8 @@ export type SettingsRow = {
   telegram_chat_id?: string | null;
   telegram_venues?: string | null;
   entry_mode?: string | null;
+  entry_phase_mode?: string | null;
+  margin_mode?: string | null;
   safe_limit_mode?: number | null;
   limit_ttl_bars?: number | null;
   max_limit_queue?: number | null;
@@ -163,6 +166,8 @@ export function publicSettings(row: SettingsRow, opts?: { unlocked?: boolean }) 
     telegramChatId: row.telegram_chat_id ?? "",
     telegramVenues: parseTelegramVenues(row.telegram_venues),
     entryMode: parseEntryMode(row.entry_mode),
+    entryPhaseMode: parseEntryPhaseMode(row.entry_phase_mode),
+    marginMode: parseMarginMode(row.margin_mode),
     safeLimitMode: row.safe_limit_mode == null ? true : Boolean(num(row.safe_limit_mode, 1)),
     limitTtlBars: clampLimitTtlBars(row.limit_ttl_bars),
     maxLimitQueue: row.max_limit_queue == null ? 8 : clampMaxLimitQueue(row.max_limit_queue),
@@ -227,6 +232,8 @@ async function ensureTickHardeningColumns(sql: Awaited<ReturnType<typeof getSql>
     "alter table desk_settings add column if not exists max_limit_queue integer not null default 8",
     "alter table desk_settings add column if not exists auto_trim_excess integer not null default 0",
     "alter table desk_settings add column if not exists min_leverage integer not null default 1",
+    "alter table desk_settings add column if not exists entry_phase_mode text not null default 'both'",
+    "alter table desk_settings add column if not exists margin_mode text not null default 'cross'",
     "create table if not exists limit_orders (id serial primary key, mode text not null default 'paper', venue text not null default 'paper', symbol text not null, timeframe text not null, indicator text not null, side text not null, entry double precision not null, sl double precision not null, tp double precision not null, rr double precision not null, atr double precision, be_at_r double precision, qty double precision not null, leverage integer not null default 1, notional_usd double precision not null default 0, risk_usd double precision not null default 0, margin_usd double precision not null default 0, armed_bar_time bigint not null, ftc_wait integer not null default 8, max_wait_bars integer not null default 8, reason text, exchange_order_id text, status text not null default 'pending', cancel_reason text, distance_atr double precision, created_at timestamptz not null default now(), updated_at timestamptz not null default now(), closed_at timestamptz)",
     "alter table limit_orders add column if not exists distance_atr double precision",
     "create unique index if not exists limit_orders_dedupe_idx on limit_orders (symbol, timeframe, indicator, armed_bar_time)",
@@ -271,7 +278,15 @@ export async function getSettings(): Promise<SettingsRow> {
     }
   }
   await ensureTickHardeningColumns(sql);
-  if (!("telegram_venues" in row) || !("entry_mode" in row) || !("max_limit_queue" in row) || !("auto_trim_excess" in row) || !("min_leverage" in row)) {
+  if (
+    !("telegram_venues" in row) ||
+    !("entry_mode" in row) ||
+    !("max_limit_queue" in row) ||
+    !("auto_trim_excess" in row) ||
+    !("min_leverage" in row) ||
+    !("entry_phase_mode" in row) ||
+    !("margin_mode" in row)
+  ) {
     const again = await sql<SettingsRow>`select * from desk_settings where id = 1`;
     if (again[0]) row = again[0];
   }
@@ -338,6 +353,8 @@ export type SettingsPatch = Partial<{
   telegram_chat_id: string | null;
   telegram_venues: string;
   entry_mode: string;
+  entry_phase_mode: string;
+  margin_mode: string;
   safe_limit_mode: number;
   limit_ttl_bars: number;
   max_limit_queue: number;
@@ -382,6 +399,8 @@ export async function patchSettings(patch: SettingsPatch) {
     "telegram_chat_id",
     "telegram_venues",
     "entry_mode",
+    "entry_phase_mode",
+    "margin_mode",
     "safe_limit_mode",
     "limit_ttl_bars",
     "max_limit_queue",

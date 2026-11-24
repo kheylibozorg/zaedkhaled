@@ -607,6 +607,15 @@ export const asterAdapter: ExchangeAdapter = {
         : Number(order.qty.toPrecision(6));
       if (!qty) return { ok: false, message: `Aster size below min for ${order.symbol}` };
       const wantLev = capLeverage(order.leverage);
+      const wantMarginType = order.marginMode === "isolated" ? "ISOLATED" : "CROSSED";
+      try {
+        await signed(account, "POST", "/fapi/v1/marginType", {
+          symbol: order.symbol,
+          marginType: wantMarginType,
+        });
+      } catch {
+        /* -4046 No need to change margin type, or position already open */
+      }
       try {
         await signed(account, "POST", "/fapi/v1/leverage", {
           symbol: order.symbol,
@@ -729,6 +738,15 @@ export const asterAdapter: ExchangeAdapter = {
       const limitPx = spec ? roundPrice(order.entry, spec.tickSize) : Number(order.entry.toPrecision(8));
       if (!(limitPx > 0)) return { ok: false, message: `Invalid Aster limit price for ${order.symbol}` };
       const wantLev = capLeverage(order.leverage);
+      const wantMarginType = order.marginMode === "isolated" ? "ISOLATED" : "CROSSED";
+      try {
+        await signed(account, "POST", "/fapi/v1/marginType", {
+          symbol: order.symbol,
+          marginType: wantMarginType,
+        });
+      } catch {
+        /* -4046 No need to change margin type, or position already open */
+      }
       try {
         await signed(account, "POST", "/fapi/v1/leverage", {
           symbol: order.symbol,
