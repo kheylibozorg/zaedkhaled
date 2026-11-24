@@ -45,13 +45,13 @@ export const copy = {
     capitalBaseHint:
       "از کل: همیشه همان درصد از کل حساب؛ اگر آزاد کمتر بود همان آزاد می‌رود. از آزاد: درصد از پولی که الان درگیر نیست.",
     scanBatch: "ارز در هر تیک",
-    minLev: "حداقل اهرم (از)",
-    autoLev: "حداکثر اهرم (تا)",
+    minLev: "شروع محدوده اهرم (از)",
+    autoLev: "سقف اهرم (تا)",
     stackLev: "سقف اهرم با چند معاملهٔ همزمان",
     stackLevCount: "تعداد معامله",
     stackLevCap: "سقف بعدی",
     stackLevHint:
-      "اگر این تعداد معامله با اهرمی بالاتر از سقف دوم همزمان باز باشد، معاملهٔ بعدی حداکثر با همان سقف دوم باز می‌شود. ۰ = این قانون خاموش.",
+      "ارزهای زیرِ این محدوده بدون محدودیت با سقف خودشان باز می‌شوند. اگر این تعداد معامله در محدودهٔ انتخابی (یا در نبود کف، بالای سقف دوم) همزمان باز باشد، سقف اهرم برای ارزهای بعدی می‌شود «سقف بعدی». ۰ = خاموش.",
     maxPos: "حداکثر همزمان",
     maxPosHint: "سقف معاملهٔ باز. یک ارز = یک پوزیشن. یک کندل = یک معامله، حتی اگر چند موتور با هم سیگنال بدهند.",
     htfMaxPos: "سقف ۱س + ۴س",
@@ -241,13 +241,13 @@ export const copy = {
     capitalBaseHint:
       "Total: always that % of the whole account; if free is smaller, free is used. Free: % of cash not already in a trade.",
     scanBatch: "Coins per tick",
-    minLev: "Min leverage (from)",
+    minLev: "Range start (from)",
     autoLev: "Max leverage (to)",
     stackLev: "Stack cap (high-leverage concurrent)",
     stackLevCount: "Concurrent trades",
     stackLevCap: "Then cap at",
     stackLevHint:
-      "If this many open trades already have leverage above the second cap, the next fill uses that cap. 0 = off.",
+      "Coins below the range still enter normally at their own max. Once this many open trades are inside the selected range (or above the second cap when Min = 1x), subsequent fills cap at the second cap. 0 = off.",
     maxPos: "Max concurrent",
     maxPosHint: "Open-trade cap. One coin = one position. One candle = one fill, even if several engines fire together.",
     htfMaxPos: "Max 1h + 4h",

@@ -415,8 +415,8 @@ function Home() {
             </div>
             <span className="text-xs text-subtle">
               {locale === "fa"
-                ? `${(s.minLeverage ?? 1) > 1 ? `محدوده اهرم ${s.minLeverage}x تا ${s.maxLeverage ?? 200}x` : `سقف اهرم ${s.maxLeverage ?? 200}x`}${Number(s.stackLevCount) > 0 ? ` · بعد از ${s.stackLevCount} معاملهٔ >${s.stackLevCap}x می‌شود ${s.stackLevCap}x` : ""}`
-                : `${(s.minLeverage ?? 1) > 1 ? `Leverage range ${s.minLeverage}x–${s.maxLeverage ?? 200}x` : `Leverage cap ${s.maxLeverage ?? 200}x`}${Number(s.stackLevCount) > 0 ? ` · after ${s.stackLevCount} opens >${s.stackLevCap}x → ${s.stackLevCap}x` : ""}`}
+                ? `${(s.minLeverage ?? 1) > 1 ? `محدوده اهرم ${s.minLeverage}x تا ${s.maxLeverage ?? 200}x` : `سقف اهرم ${s.maxLeverage ?? 200}x`}${Number(s.stackLevCount) > 0 ? (s.minLeverage ?? 1) > 1 ? ` · بعد از ${s.stackLevCount} معامله در محدوده می‌شود ${s.stackLevCap}x` : ` · بعد از ${s.stackLevCount} معاملهٔ >${s.stackLevCap}x می‌شود ${s.stackLevCap}x` : ""}`
+                : `${(s.minLeverage ?? 1) > 1 ? `Leverage range ${s.minLeverage}x–${s.maxLeverage ?? 200}x` : `Leverage cap ${s.maxLeverage ?? 200}x`}${Number(s.stackLevCount) > 0 ? (s.minLeverage ?? 1) > 1 ? ` · after ${s.stackLevCount} in range → ${s.stackLevCap}x` : ` · after ${s.stackLevCount} opens >${s.stackLevCap}x → ${s.stackLevCap}x` : ""}`}
             </span>
           </div>
           <div className="mb-4 grid gap-3 rounded-lg border border-accent/50 bg-surface-2 p-3">
@@ -494,7 +494,6 @@ function Home() {
               {(() => {
                 const userCap = Math.min(200, Math.max(1, Math.round(Number(maxLev) || 200)));
                 const userMin = Math.min(userCap, Math.max(1, Math.round(Number(minLev) || 1)));
-                const inRangeCount = data.universe.filter((a) => Math.round(Number(a.max_leverage) || 0) >= userMin).length;
                 const btc = data.universe.find((a) => a.base === "BTC") ?? data.universe[0];
                 const venueLev = Number(btc?.max_leverage) || 25;
                 const lev = Math.min(userCap, venueLev);
@@ -503,8 +502,8 @@ function Home() {
                 const notional = pile * (capN / 100) * lev;
                 const coin = btc?.base ?? "BTC";
                 return locale === "fa"
-                  ? `محدوده ${userMin}x تا ${userCap}x${userMin > 1 ? ` (${inRangeCount} ارز مجاز با سقف ≥${userMin}x)` : ""}. ربات از سقف خود ارز بالاتر نمی‌رود. الان: ${capN}٪ مارجین × ${lev}x روی ${coin} ≈ ${fmtUsd(notional, 0)} حجم · سقف ارز ${venueLev}x`
-                  : `Range ${userMin}x–${userCap}x${userMin > 1 ? ` (${inRangeCount} coins qualify at ≥${userMin}x)` : ""}. Never above that coin's venue max. Now: ${capN}% margin × ${lev}x on ${coin} ≈ ${fmtUsd(notional, 0)} notional · venue max ${venueLev}x`;
+                  ? `${userMin > 1 ? `محدوده ${userMin}x تا ${userCap}x (ارزهای زیر ${userMin}x با سقف خودشان وارد می‌شوند).` : `سقف ${userCap}x.`} ربات از سقف خود ارز بالاتر نمی‌رود. الان: ${capN}٪ مارجین × ${lev}x روی ${coin} ≈ ${fmtUsd(notional, 0)} حجم · سقف ارز ${venueLev}x`
+                  : `${userMin > 1 ? `Range ${userMin}x–${userCap}x (coins below ${userMin}x still enter at their own max).` : `Cap ${userCap}x.`} Never above that coin's venue max. Now: ${capN}% margin × ${lev}x on ${coin} ≈ ${fmtUsd(notional, 0)} notional · venue max ${venueLev}x`;
               })()}
             </p>
             <div className="mt-2 grid grid-cols-2 gap-2 border-t border-border/60 pt-3">
@@ -832,8 +831,8 @@ function Home() {
                 ? " بدون کف مارکت‌کپ."
                 : " No market-cap floor."}
             {locale === "fa"
-              ? ` سقف اهرم ${s.maxLeverage ?? 200}x — بالاتر از سقف خود ارز نمی‌رود.${Number(s.stackLevCount) > 0 ? ` اگر ${s.stackLevCount} معامله با اهرم >${s.stackLevCap}x همزمان باز باشد سقف می‌شود ${s.stackLevCap}x.` : ""}`
-              : ` Leverage cap ${s.maxLeverage ?? 200}x — never above that coin's venue max.${Number(s.stackLevCount) > 0 ? ` After ${s.stackLevCount} concurrent opens above ${s.stackLevCap}x, the cap becomes ${s.stackLevCap}x.` : ""}`}
+              ? ` ${(s.minLeverage ?? 1) > 1 ? `محدوده اهرم ${s.minLeverage}x تا ${s.maxLeverage ?? 200}x (ارزهای زیر ${s.minLeverage}x هم با سقف خودشان باز می‌شوند)` : `سقف اهرم ${s.maxLeverage ?? 200}x`} — بالاتر از سقف خود ارز نمی‌رود.${Number(s.stackLevCount) > 0 ? (s.minLeverage ?? 1) > 1 ? ` اگر ${s.stackLevCount} معامله در محدوده ${s.minLeverage}–${s.maxLeverage ?? 200}x همزمان باز باشد سقف بعدی می‌شود ${s.stackLevCap}x.` : ` اگر ${s.stackLevCount} معامله با اهرم >${s.stackLevCap}x همزمان باز باشد سقف می‌شود ${s.stackLevCap}x.` : ""}`
+              : ` ${(s.minLeverage ?? 1) > 1 ? `Leverage range ${s.minLeverage}x–${s.maxLeverage ?? 200}x (below-${s.minLeverage}x coins still enter at their own max)` : `Leverage cap ${s.maxLeverage ?? 200}x`} — never above that coin's venue max.${Number(s.stackLevCount) > 0 ? (s.minLeverage ?? 1) > 1 ? ` After ${s.stackLevCount} concurrent opens in ${s.minLeverage}–${s.maxLeverage ?? 200}x, the cap becomes ${s.stackLevCap}x.` : ` After ${s.stackLevCount} concurrent opens above ${s.stackLevCap}x, the cap becomes ${s.stackLevCap}x.` : ""}`}
             {!unlocked
               ? locale === "fa"
                 ? " · برای ذخیره، از صرافی‌ها پین را باز کن."

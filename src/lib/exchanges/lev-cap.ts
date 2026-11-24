@@ -22,30 +22,28 @@ export function normalizeLeverageRange(
   return { min, max };
 }
 
-export function isCoinWithinLeverageRange(coinMaxLev: number, minLev: number): boolean {
-  const min = clampMinLeverage(minLev);
-  if (min <= 1) return true;
-  const coinMax = Math.round(Number(coinMaxLev) || 0);
-  return coinMax >= min;
-}
-
 /**
- * If `count` open trades already have leverage > `cap`, new fills use `cap`
- * as the user ceiling (still never above `userCap`). Count 0 disables.
+ * If `count` open trades already sit inside `[minLev .. userCap]` (when
+ * `minLev > 1`) or exceed `cap` (when `minLev <= 1`), subsequent fills cap at
+ * `cap` (never raising `userCap`). Coins below `minLev` still enter normally.
  */
 export function stackedUserLevCap(
   userCap: number,
   openLevs: readonly number[],
   count: number,
   cap: number,
+  minLev = 1,
 ) {
   const user = capLeverage(userCap, 200);
+  const min = Math.min(user, clampMinLeverage(minLev));
   const n = Math.round(Number(count));
   if (!Number.isFinite(n) || n <= 0) return user;
   const stacked = Math.min(user, capLeverage(cap, 75));
   let high = 0;
   for (const lev of openLevs) {
-    if (Number(lev) > stacked) {
+    const l = Number(lev);
+    const matches = min > 1 ? l >= min && l <= user : l > stacked;
+    if (matches) {
       high += 1;
       if (high >= n) return stacked;
     }

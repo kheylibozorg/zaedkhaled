@@ -77,7 +77,7 @@ import {
 } from "@/lib/engine/scan-schedule";
 import { bookVenue, chartHostLabel, getAdapter, resolveMaxLeverage, sameCoin, venueSymbol } from "@/lib/exchanges/registry";
 import { venueMaxLeverage, loadPublicLeverageMaps } from "@/lib/exchanges/leverage";
-import { capLeverage, isCoinWithinLeverageRange, normalizeLeverageRange, stackedUserLevCap } from "@/lib/exchanges/lev-cap";
+import { capLeverage, normalizeLeverageRange, stackedUserLevCap } from "@/lib/exchanges/lev-cap";
 import type { ExchangeAccount, ExchangeAdapter, PlaceOrderResult, ProtectionSnapshot, VenueOpenOrder } from "@/lib/exchanges/types";
 import { readVenueWallet, usedMarginUsd, attachAvailable } from "@/lib/exchanges/wallet";
 import {
@@ -1379,11 +1379,9 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
             currentPreArmed = undefined;
           }
         }
-        const orderCoinMax = minLev > 1 ? await coinMaxLev(o.symbol) : 200;
         const gateMuted =
           !isEngineOn(engineGates, o.indicator as IndicatorName, tf) ||
-          !isSideOn(sideGates, o.indicator, side, tf, tfSideGates) ||
-          !isCoinWithinLeverageRange(orderCoinMax, minLev);
+          !isSideOn(sideGates, o.indicator, side, tf, tfSideGates);
         const evalRes = evaluatePendingLimit({
           order: {
             symbol: o.symbol,
@@ -1584,11 +1582,9 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           currentPreArmed = undefined;
         }
       }
-      const watchCoinMax = minLev > 1 ? await coinMaxLev(w.symbol) : 200;
       const gateMuted =
         !isEngineOn(engineGates, w.indicator as IndicatorName, tf) ||
-        !isSideOn(sideGates, w.indicator, side, tf, tfSideGates) ||
-        !isCoinWithinLeverageRange(watchCoinMax, minLev);
+        !isSideOn(sideGates, w.indicator, side, tf, tfSideGates);
       const evalRes = evaluatePendingLimit({
         order: {
           symbol: w.symbol,
@@ -1697,10 +1693,6 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           continue;
         }
         const coinMax = await coinMaxLev(cand.symbol);
-        if (!isCoinWithinLeverageRange(coinMax, minLev)) {
-          if (cand.existingWatchId) await cancelLimitOrder(cand.existingWatchId, "gate muted").catch(() => undefined);
-          continue;
-        }
         const gateCheck = canQueueLimitOrder({
           safeLimitMode,
           maxPositions: settings.max_positions,
@@ -1724,7 +1716,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         if (live && (!liveBalReady || !liveBookReady || liveBlock)) continue;
         const sizingAvail = safeLimitMode ? Math.max(0, available - reservedMarginBetween) : available;
         if (sizingAvail <= 0) continue;
-        const lev = Math.min(stackedUserLevCap(levCapB, openLevs, stackCntB, stackCapB), coinMax);
+        const lev = Math.min(stackedUserLevCap(levCapB, openLevs, stackCntB, stackCapB, minLev), coinMax);
         const capPct = capitalPctForLeverage(coinMax, capPctDefB, tiersB);
         const sized = sizePosition({
           equity,
@@ -2179,11 +2171,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       }
 
       const coinMax = await coinMaxLev(armed.symbol);
-      if (!isCoinWithinLeverageRange(coinMax, minLev)) {
-        if (armed.existingWatchId) await cancelLimitOrder(armed.existingWatchId, "gate muted").catch(() => undefined);
-        continue;
-      }
-      const lev = Math.min(stackedUserLevCap(userLevCap, openLevs, stackCount, stackCap), coinMax);
+      const lev = Math.min(stackedUserLevCap(userLevCap, openLevs, stackCount, stackCap, minLev), coinMax);
       const capitalPct = capitalPctForLeverage(coinMax, capitalPctDefault, levSizeTiers);
 
       const mustStageWatch =
@@ -2696,10 +2684,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         }
       }
       const coinMax = await coinMaxLev(s.symbol);
-      if (!isCoinWithinLeverageRange(coinMax, minLev)) {
-        skip = `below min leverage (${coinMax}x < ${minLev}x)`;
-      }
-      const lev = Math.min(stackedUserLevCap(userLevCap, openLevs, stackCount, stackCap), coinMax);
+      const lev = Math.min(stackedUserLevCap(userLevCap, openLevs, stackCount, stackCap, minLev), coinMax);
       // Bucket on the coin's venue max, not the used (user/stack-capped) leverage.
       const capitalPct = capitalPctForLeverage(coinMax, capitalPctDefault, levSizeTiers);
       const sized = skip
