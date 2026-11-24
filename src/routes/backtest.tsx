@@ -1,32 +1,47 @@
 import { createFileRoute, Link, useRouter } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
-import { RotateCcw } from "lucide-react";
+import { AlertTriangle, RotateCcw, ShieldCheck } from "lucide-react";
 import { DeskShell } from "@/components/desk/shell";
 import { StatusChip } from "@/components/desk/status-chip";
-import { Kpi } from "@/components/desk/tables";
+import { EntryOriginBadge, Kpi, limitCancelLabel } from "@/components/desk/tables";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Label, Select } from "@/components/ui/field";
 import {
   analyzeBacktest,
+  analyzeLimitFunnel,
+  isDemoSampleTrade,
   journalToAnalyzed,
   type AnalyzedTrade,
   type Finding,
+  type LimitOrderAnalyzeRow,
+  type LimitOriginFunnel,
   type SliceStats,
 } from "@/lib/engine/backtest-analyze";
 import { filterJournal, journalOptions, type JournalTrade } from "@/lib/engine/journal";
 import { indicatorLabel } from "@/lib/engine/types";
-import { getJournal, resetDeskJournal, seedDeskJournal } from "@/lib/server/functions";
+import { getBacktestAnalyze, resetDeskJournal } from "@/lib/server/functions";
 import { useLiveDesk } from "@/lib/use-live-desk";
 import { useLocale } from "@/lib/locale";
 import { cn, fmtPct, fmtPx, fmtR, fmtUsd } from "@/lib/utils";
 
 export const Route = createFileRoute("/backtest")({
-  loader: () => getJournal(),
+  loader: () => getBacktestAnalyze(),
   component: Page,
 });
 
-type Filter = "all" | "long" | "short" | "sl" | "tp" | "be" | "scratch" | "giveback";
+type Filter =
+  | "all"
+  | "pre_arm"
+  | "armed_limit"
+  | "market"
+  | "long"
+  | "short"
+  | "sl"
+  | "tp"
+  | "be"
+  | "scratch"
+  | "giveback";
 
 function Page() {
   const data = Route.useLoaderData();
@@ -36,33 +51,56 @@ function Page() {
   useLiveDesk(20000);
 
   const [mode, setMode] = useState("all");
+  const [entryOrigin, setEntryOrigin] = useState("all");
   const [indicator, setIndicator] = useState("all");
   const [timeframe, setTimeframe] = useState("all");
   const [side, setSide] = useState("all");
   const [filter, setFilter] = useState<Filter>("all");
+  const [previewSample, setPreviewSample] = useState(false);
   const [confirm, setConfirm] = useState<null | "closed" | "paper">(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
 
-  const closed = data.closed as JournalTrade[];
+  const allClosed = data.closed as JournalTrade[];
+  const realClosed = useMemo(() => allClosed.filter((r) => !isDemoSampleTrade(r)), [allClosed]);
+  const demoClosed = useMemo(() => allClosed.filter((r) => isDemoSampleTrade(r)), [allClosed]);
+
+  // Never mix synthetic demo blotter rows into real trading analytics.
+  const usingSample = realClosed.length === 0 && demoClosed.length > 0 && previewSample;
+  const closed = usingSample ? demoClosed : realClosed;
+
+  const limitOrders = useMemo(
+    () => (usingSample ? [] : ((data.limitOrders ?? []) as LimitOrderAnalyzeRow[])),
+    [data.limitOrders, usingSample],
+  );
+
   const opts = useMemo(() => journalOptions(closed), [closed]);
   const filtered = useMemo(
-    () => filterJournal(closed, { indicator, timeframe, side, mode }),
-    [closed, indicator, timeframe, side, mode],
+    () => filterJournal(closed, { indicator, timeframe, side, mode, entryOrigin }),
+    [closed, indicator, timeframe, side, mode, entryOrigin],
   );
   const analysis = useMemo(() => analyzeBacktest(journalToAnalyzed(filtered)), [filtered]);
+  const funnel = useMemo(
+    () => analyzeLimitFunnel(limitOrders, { mode, indicator, timeframe, side, entryOrigin }),
+    [limitOrders, mode, indicator, timeframe, side, entryOrigin],
+  );
 
   const rows = useMemo(() => {
     const all = analysis.all;
     if (filter === "all") return all;
+    if (filter === "pre_arm" || filter === "armed_limit" || filter === "market") {
+      return all.filter((x) => x.entryOrigin === filter);
+    }
     if (filter === "long" || filter === "short") return all.filter((x) => x.side === filter);
-    if (filter === "sl" || filter === "tp" || filter === "be") return all.filter((x) => x.reason === filter);
-    if (filter === "scratch") return all.filter((x) => x.scratch || (x.pnlR >= 0 && x.pnlR < 0.3));
+    if (filter === "sl") return all.filter((x) => x.reason === "sl" || x.reason === "liq");
+    if (filter === "tp" || filter === "be") return all.filter((x) => x.reason === filter);
+    if (filter === "scratch") return all.filter((x) => x.scratch || (!x.noProfit && x.pnlR >= 0 && x.pnlR < 0.3));
     return all.filter((x) => x.stoppedFromProfit);
   }, [analysis, filter]);
 
   const unlocked = data.lock.unlocked;
   const hasPin = data.lock.hasPin;
+  const emptyReal = !realClosed.length;
   const empty = !closed.length;
 
   async function reset(scope: "closed" | "paper") {
@@ -71,24 +109,11 @@ function Page() {
     try {
       await resetDeskJournal({ data: { scope } });
       setConfirm(null);
+      setPreviewSample(false);
       setMsg(t.resetDone);
       await router.invalidate({ sync: true });
     } catch (e) {
       setMsg(e instanceof Error ? e.message : "reset failed");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function loadSample() {
-    setBusy(true);
-    setMsg(null);
-    try {
-      const res = await seedDeskJournal();
-      setMsg(res.skipped ? t.sampleSkip : t.sampleLoaded);
-      await router.invalidate({ sync: true });
-    } catch (e) {
-      setMsg(e instanceof Error ? e.message : "seed failed");
     } finally {
       setBusy(false);
     }
@@ -110,17 +135,37 @@ function Page() {
       <div className="flex min-w-0 flex-col gap-5">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div className="min-w-0">
-            <h1 className="font-display text-3xl tracking-tight">{t.backtest}</h1>
+            <div className="flex flex-wrap items-center gap-2.5">
+              <h1 className="font-display text-3xl tracking-tight">{t.backtest}</h1>
+              {!usingSample && !emptyReal ? (
+                <Badge tone="long">
+                  <ShieldCheck className="me-1 size-3" strokeWidth={2} />
+                  {fa ? "داده واقعی ربات" : "Verified bot fills"}
+                </Badge>
+              ) : null}
+              {usingSample ? (
+                <Badge tone="warn">
+                  <AlertTriangle className="me-1 size-3" strokeWidth={2} />
+                  {fa ? "پیش‌نمایش نمونه (غیرواقعی)" : "Sample preview (synthetic)"}
+                </Badge>
+              ) : null}
+            </div>
             <p className="mt-2 max-w-3xl text-sm text-muted">
               {fa
-                ? "همه معاملات کاغذی و واقعی، دسته‌به‌دسته: اندیکاتور، تایم‌فریم، لانگ/شورت، نحوه ورود. کدام استاپ می‌خورد، کدام سود می‌دهد، کدام تقریباً هیچ."
-                : "Every paper and live fill, batched by engine, timeframe, side and entry. Which stops out, which pays, which barely does."}
+                ? "تحلیل واقعی و بدون دست‌کاری از معاملات بسته‌شدهٔ ربات (کاغذی و لایو) به تفکیک پیش‌لیمیت، لیمیت FTC، مارکت، اندیکاتور و تایم‌فریم، همراه با سود خالص پس از کارمزد و قیف واقعی صف سفارش‌ها."
+                : "Verified post-fee analysis of real bot fills across Pre-Arm, FTC Limit, Market, engine and timeframe, paired with the live limit-order queue funnel."}
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
-            {empty ? (
-              <Button variant="outline" onClick={loadSample} disabled={busy}>
-                {t.loadSample}
+            {emptyReal && demoClosed.length > 0 ? (
+              <Button variant="outline" onClick={() => setPreviewSample((v) => !v)} disabled={busy}>
+                {previewSample
+                  ? fa
+                    ? "بازگشت به حالت واقعی"
+                    : "Back to real only"
+                  : fa
+                    ? `پیش‌نمایش روی دفتر نمونه (${demoClosed.length})`
+                    : `Preview sample blotter (${demoClosed.length})`}
               </Button>
             ) : null}
             <Button variant="danger" onClick={() => setConfirm(confirm ? null : "closed")} disabled={busy}>
@@ -129,6 +174,22 @@ function Page() {
             </Button>
           </div>
         </div>
+
+        {usingSample ? (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-warn/40 bg-surface-2 px-4 py-3 text-sm">
+            <div className="flex items-center gap-2 text-fg">
+              <AlertTriangle className="size-4 shrink-0 text-warn" strokeWidth={2} />
+              <span>
+                {fa
+                  ? "توجه: این اعداد صرفاً روی دفتر نمونهٔ نمایشی ساخته شده‌اند و عملکرد واقعی ربات نیستند."
+                  : "Notice: these metrics are computed strictly from the synthetic sample blotter, not real bot fills."}
+              </span>
+            </div>
+            <Button variant="outline" className="min-h-9 px-3 text-xs" onClick={() => setPreviewSample(false)}>
+              {fa ? "بستن پیش‌نمایش" : "Exit preview"}
+            </Button>
+          </div>
+        ) : null}
 
         {confirm ? (
           <div className="rounded-lg border border-short/40 bg-short-dim/25 p-4">
@@ -183,17 +244,33 @@ function Page() {
         {msg ? <p className="text-sm text-muted">{msg}</p> : null}
 
         {empty ? (
-          <section className="rounded-lg border border-border bg-surface p-8 shadow-panel">
-            <h2 className="font-display text-2xl tracking-tight">{fa ? "هنوز معامله‌ای نیست" : "No fills yet"}</h2>
-            <p className="mt-2 max-w-xl text-sm text-muted">
-              {fa
-                ? "بعد از فیل‌های کاغذی یا واقعی، آنالیز اینجا ساخته می‌شود. برای دیدن شکل صفحه، دفتر نمونه را بار کن."
-                : "Paper and live fills land here. Load the sample blotter to see the readout."}
-            </p>
-          </section>
+          <div className="grid gap-4">
+            <section className="rounded-lg border border-border bg-surface p-6 shadow-panel sm:p-8">
+              <h2 className="font-display text-2xl tracking-tight">
+                {fa ? "هنوز معاملهٔ واقعی/کاغذیِ بسته‌شده‌ای ثبت نشده" : "No real or paper bot fills closed yet"}
+              </h2>
+              <p className="mt-2 max-w-2xl text-sm text-muted">
+                {demoClosed.length > 0
+                  ? fa
+                    ? `برای اینکه داده‌های آنالیز کاملاً واقعی و قابل اتکا باشند، ${demoClosed.length} معاملهٔ نمایشیِ دفتر نمونه به‌صورت خودکار کنار گذاشته شدند. به محض بسته شدن اولین معاملات ربات (پیش‌لیمیت، لیمیت FTC یا مارکت)، آمار دقیق اینجا نمایش داده می‌شود.`
+                    : `To keep Analyze 100% trustworthy, ${demoClosed.length} synthetic sample blotter trades are excluded. Metrics appear automatically as soon as the bot closes real paper or live trades.`
+                  : fa
+                    ? "بعد از اولین معاملات بسته‌شدهٔ ربات (پیش‌لیمیت، لیمیت FTC یا مارکت)، آنالیز واقعی اینجا ساخته می‌شود."
+                    : "Real Pre-Arm, FTC Limit, and Market analytics build here as soon as the bot closes fills."}
+              </p>
+              {demoClosed.length > 0 ? (
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <Button variant="outline" onClick={() => setPreviewSample(true)} disabled={busy}>
+                    {fa ? `پیش‌نمایش ساختار صفحه روی دفتر نمونه (${demoClosed.length})` : `Preview layout on sample blotter (${demoClosed.length})`}
+                  </Button>
+                </div>
+              ) : null}
+            </section>
+            {funnel.all.total > 0 ? <LimitFunnelSection funnel={funnel} fa={fa} t={t} /> : null}
+          </div>
         ) : (
           <>
-            <div className="grid gap-3 rounded-lg border border-border bg-surface p-4 shadow-panel sm:grid-cols-2 lg:grid-cols-4">
+            <div className="grid gap-3 rounded-lg border border-border bg-surface p-4 shadow-panel sm:grid-cols-2 lg:grid-cols-5">
               <div className="grid gap-1.5">
                 <Label>{t.mode}</Label>
                 <Select value={mode} onChange={(e) => setMode(e.target.value)}>
@@ -203,6 +280,15 @@ function Page() {
                       {m === "live" ? t.live : m === "paper" ? t.paper : m}
                     </option>
                   ))}
+                </Select>
+              </div>
+              <div className="grid gap-1.5">
+                <Label>{t.entryOrigin}</Label>
+                <Select value={entryOrigin} onChange={(e) => setEntryOrigin(e.target.value)}>
+                  <option value="all">{t.all}</option>
+                  <option value="pre_arm">{t.originPreArm}</option>
+                  <option value="armed_limit">{t.originArmedLimit}</option>
+                  <option value="market">{t.originMarket}</option>
                 </Select>
               </div>
               <div className="grid gap-1.5">
@@ -239,32 +325,55 @@ function Page() {
 
             <p className="text-sm text-muted">
               {fa
-                ? `${analysis.n} از ${closed.length} فیل بسته در این برش.`
-                : `${analysis.n} of ${closed.length} closed fills in this cut.`}
+                ? `${analysis.n} از ${closed.length} فیل بسته‌شده در این برش${!usingSample && demoClosed.length > 0 ? ` (${demoClosed.length} رکورد نمونه حذف شده)` : ""}.`
+                : `${analysis.n} of ${closed.length} closed fills in this cut${!usingSample && demoClosed.length > 0 ? ` (${demoClosed.length} sample rows excluded)` : ""}.`}
             </p>
 
             <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
               <Kpi label={t.trades} value={String(analysis.n)} hint={`${analysis.n - analysis.noProfitN}W / ${analysis.noProfitN}L`} />
-              <Kpi label={t.winRate} value={fmtPct(analysis.wr)} />
+              <Kpi
+                label={t.winRate}
+                value={fmtPct(analysis.wr)}
+                hint={fa ? "برد خالص پس از کارمزد" : "Net post-fee win rate"}
+              />
               <Kpi label={t.expect} value={fmtR(analysis.expectR)} tone={analysis.expectR >= 0 ? "long" : "short"} />
-              <Kpi label={t.netR} value={fmtR(analysis.netR)} tone={analysis.netR >= 0 ? "long" : "short"} />
+              <Kpi
+                label={t.pnl}
+                value={fmtUsd(analysis.netUsd)}
+                hint={`${fmtR(analysis.netR)} · PF ${analysis.profitFactor ? analysis.profitFactor.toFixed(2) : "—"} · ${t.fees} ${fmtUsd(analysis.feesUsd)}`}
+                tone={analysis.netUsd >= 0 ? "long" : "short"}
+              />
             </div>
             <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
               <Kpi
-                label={fa ? "استاپ‌خورده" : "Stopped"}
+                label={fa ? "استاپ / لیکوئید" : "Stopped / Liq"}
                 value={fmtPct(analysis.slPct)}
-                hint={`${analysis.slN} SL · ${analysis.tpN} TP · ${analysis.beN} BE`}
+                hint={[
+                  `${analysis.slN} SL`,
+                  `${analysis.tpN} TP`,
+                  `${analysis.beN} BE`,
+                  analysis.liqN ? `${analysis.liqN} Liq` : null,
+                  analysis.trimN ? `${analysis.trimN} Trim` : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
                 tone={analysis.slPct >= 60 ? "short" : "fg"}
               />
               <Kpi
                 label={fa ? "سود ناچیز/صفر" : "Dead / scratch"}
                 value={String(analysis.scratchN + analysis.noProfitN)}
-                hint={`${analysis.noProfitN} ${fa ? "بدون سود" : "no profit"} · ${analysis.scratchN} ${fa ? "ناچیز" : "scratch"}`}
+                hint={`${analysis.noProfitN} ${fa ? "بدون سود خالص" : "no net profit"} · ${analysis.scratchN} ${fa ? "ناچیز" : "scratch"}`}
               />
               <Kpi
                 label={fa ? "جذب حرکت" : "Capture"}
                 value={analysis.avgCapture ? fmtPct(analysis.avgCapture * 100) : "—"}
-                hint={`MAE ${fmtR(analysis.avgMae)} · MFE ${fmtR(analysis.avgMfe)}`}
+                hint={
+                  analysis.excursionSampleN > 0
+                    ? `MAE ${fmtR(analysis.avgMae)} · MFE ${fmtR(analysis.avgMfe)} (${analysis.excursionSampleN}/${analysis.n})`
+                    : fa
+                      ? "داده MAE/MFE ثبت نشده"
+                      : "No MAE/MFE data"
+                }
               />
               <Kpi
                 label={fa ? "برگشت از سود" : "Giveback"}
@@ -272,6 +381,14 @@ function Page() {
                 hint={fa ? "رفت تو سود، بعد مرد" : "Went green, then died"}
               />
             </div>
+
+            <SliceTable
+              title={fa ? "بر اساس نوع ورود (پیش‌لیمیت · لیمیت FTC · مارکت)" : "By entry type (Pre-Arm · FTC Limit · Market)"}
+              rows={analysis.byEntryOrigin}
+              fa={fa}
+            />
+
+            {funnel.all.total > 0 ? <LimitFunnelSection funnel={funnel} fa={fa} t={t} /> : null}
 
             <section className="rounded-lg border border-border bg-surface p-4 shadow-panel">
               <h2 className="text-sm font-medium">{fa ? "نتیجه آنالیز" : "Engine readout"}</h2>
@@ -296,7 +413,7 @@ function Page() {
               <SliceTable title={fa ? "نحوه خروج" : "How it exited"} rows={analysis.byReason} fa={fa} />
             </div>
             {analysis.byEntry.length ? (
-              <SliceTable title={fa ? "نحوه ورود" : "Entry path"} rows={analysis.byEntry} fa={fa} />
+              <SliceTable title={fa ? "جزئیات مسیر ورود" : "Detailed entry path"} rows={analysis.byEntry} fa={fa} />
             ) : null}
             {analysis.byMode.length > 1 ? (
               <SliceTable title={fa ? "کاغذی در برابر واقعی" : "Paper vs live"} rows={analysis.byMode} fa={fa} />
@@ -368,6 +485,9 @@ function Page() {
                   {(
                     [
                       ["all", fa ? "همه" : "All"],
+                      ["pre_arm", t.originPreArm],
+                      ["armed_limit", t.originArmedLimit],
+                      ["market", t.originMarket],
                       ["long", fa ? "لانگ" : "Long"],
                       ["short", fa ? "شورت" : "Short"],
                       ["sl", fa ? "استاپ" : "SL"],
@@ -393,47 +513,58 @@ function Page() {
                 </div>
               </div>
               <div className="overflow-x-auto">
-                <table className="w-full min-w-[920px] text-sm">
+                <table className="w-full min-w-[1040px] text-sm">
                   <thead className="text-xs text-subtle">
                     <tr className="border-b border-border">
+                      <th className="px-3 py-2 text-start font-medium">{fa ? "نماد" : "Symbol"}</th>
                       <th className="px-3 py-2 text-start font-medium">{fa ? "سمت" : "Side"}</th>
+                      <th className="px-3 py-2 text-start font-medium">{t.entryOrigin}</th>
                       <th className="px-3 py-2 text-start font-medium">{fa ? "اندیکاتور" : "Engine"}</th>
                       <th className="px-3 py-2 text-start font-medium">TF</th>
                       <th className="px-3 py-2 text-start font-medium">{fa ? "ورود" : "Entry"}</th>
                       <th className="px-3 py-2 text-start font-medium">{fa ? "خروج" : "Exit"}</th>
                       <th className="px-3 py-2 text-start font-medium">R</th>
+                      <th className="px-3 py-2 text-start font-medium">{fa ? "سود خالص" : "Net $"}</th>
                       <th className="px-3 py-2 text-start font-medium">MAE</th>
                       <th className="px-3 py-2 text-start font-medium">MFE</th>
-                      <th className="px-3 py-2 text-start font-medium">{fa ? "نحوه ورود" : "Path"}</th>
+                      <th className="px-3 py-2 text-start font-medium">{fa ? "مسیر" : "Path"}</th>
                     </tr>
                   </thead>
                   <tbody className="font-mono tabular">
                     {!rows.length ? (
                       <tr>
-                        <td colSpan={9} className="px-3 py-8 text-sm text-muted">
+                        <td colSpan={12} className="px-3 py-8 text-sm text-muted">
                           {fa ? "نمونه‌ای در این فیلتر نیست." : "Nothing in this cut."}
                         </td>
                       </tr>
                     ) : (
-                      rows.map((tr) => (
-                        <tr key={`${tr.opened}-${tr.i}`} className="border-b border-border/60">
-                          <td className="px-3 py-2">
-                            <SideCell side={tr.side} fa={fa} />
-                          </td>
-                          <td className="px-3 py-2">{tr.indicator ? indicatorLabel(tr.indicator as never) || tr.indicator : "—"}</td>
-                          <td className="px-3 py-2">{tr.timeframe ?? "—"}</td>
-                          <td className="px-3 py-2">{fmtPx(tr.entry)}</td>
-                          <td className="px-3 py-2">
-                            {fmtPx(tr.exit)} <span className="text-subtle">{reasonLabel(tr.reason, fa)}</span>
-                          </td>
-                          <td className={tr.pnlR >= 0 ? "px-3 py-2 text-long" : "px-3 py-2 text-short"}>{fmtR(tr.pnlR)}</td>
-                          <td className="px-3 py-2 text-short">{fmtR(tr.maeR)}</td>
-                          <td className="px-3 py-2 text-long">{fmtR(tr.mfeR)}</td>
-                          <td className="max-w-[240px] truncate px-3 py-2 text-xs text-muted" title={tr.entryWhy}>
-                            {tr.entryWhy}
-                          </td>
-                        </tr>
-                      ))
+                      rows.map((tr) => {
+                        const netWin = tr.pnl !== 0 ? tr.pnl > 0 : tr.pnlR >= 0;
+                        return (
+                          <tr key={`${tr.opened}-${tr.i}`} className="border-b border-border/60">
+                            <td className="px-3 py-2 text-fg">{tr.symbol ? tr.symbol.replace("USDT", "") : "—"}</td>
+                            <td className="px-3 py-2">
+                              <SideCell side={tr.side} fa={fa} />
+                            </td>
+                            <td className="px-3 py-2 font-sans">
+                              <EntryOriginBadge reason={tr.entryWhy} />
+                            </td>
+                            <td className="px-3 py-2">{tr.indicator ? indicatorLabel(tr.indicator as never) || tr.indicator : "—"}</td>
+                            <td className="px-3 py-2">{tr.timeframe ?? "—"}</td>
+                            <td className="px-3 py-2">{fmtPx(tr.entry)}</td>
+                            <td className="px-3 py-2">
+                              {fmtPx(tr.exit)} <span className="text-subtle">{reasonLabel(tr.reason, fa)}</span>
+                            </td>
+                            <td className={netWin ? "px-3 py-2 text-long" : "px-3 py-2 text-short"}>{fmtR(tr.pnlR)}</td>
+                            <td className={netWin ? "px-3 py-2 text-long" : "px-3 py-2 text-short"}>{fmtUsd(tr.pnl)}</td>
+                            <td className="px-3 py-2 text-short">{tr.hasExcursion ? fmtR(tr.maeR) : "—"}</td>
+                            <td className="px-3 py-2 text-long">{tr.hasExcursion ? fmtR(tr.mfeR) : "—"}</td>
+                            <td className="max-w-[220px] truncate px-3 py-2 text-xs text-muted" title={tr.entryWhy}>
+                              {tr.entryWhy}
+                            </td>
+                          </tr>
+                        );
+                      })
                     )}
                   </tbody>
                 </table>
@@ -446,6 +577,77 @@ function Page() {
   );
 }
 
+function LimitFunnelSection({
+  funnel,
+  fa,
+  t,
+}: {
+  funnel: ReturnType<typeof analyzeLimitFunnel>;
+  fa: boolean;
+  t: ReturnType<typeof useLocale>["t"];
+}) {
+  const cards: Array<{ label: string; data: LimitOriginFunnel }> = [
+    { label: fa ? "همه لیمیت‌ها" : "All limit orders", data: funnel.all },
+    { label: t.originPreArm, data: funnel.preArm },
+    { label: t.originArmedLimit, data: funnel.armedLimit },
+  ];
+
+  return (
+    <section className="rounded-lg border border-border bg-surface p-4 shadow-panel">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h2 className="text-sm font-medium">
+          {fa ? "قیف واقعی سفارش‌های لیمیت (پیش‌لیمیت در برابر لیمیت FTC)" : "Real limit-order funnel (Pre-Arm vs FTC Limit)"}
+        </h2>
+        <span className="text-xs text-subtle">
+          {fa ? "مقایسه نرخ پر شدن و دلایل لغو از جدول صف صرافی و کمین ربات" : "Fill rate and cancellation reasons from live queue records"}
+        </span>
+      </div>
+      <div className="mt-3 grid gap-3 lg:grid-cols-3">
+        {cards.map((c) => (
+          <div key={c.label} className="rounded-md border border-border bg-bg-elev p-3">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-sm font-medium">{c.label}</span>
+              <span className="font-mono text-xs tabular text-muted">
+                {c.data.total} {fa ? "ثبت" : "total"}
+              </span>
+            </div>
+            <div className="mt-2 grid grid-cols-4 gap-2 font-mono text-xs tabular">
+              <div>
+                <div className="text-[11px] text-subtle">{fa ? "پر شده" : "Filled"}</div>
+                <div className="text-long">{c.data.filled}</div>
+              </div>
+              <div>
+                <div className="text-[11px] text-subtle">{fa ? "نرخ پر شدن" : "Fill %"}</div>
+                <div>{c.data.resolved > 0 ? fmtPct(c.data.fillRatePct, 0) : "—"}</div>
+              </div>
+              <div>
+                <div className="text-[11px] text-subtle">{fa ? "لغو" : "Cancelled"}</div>
+                <div className="text-short">{c.data.cancelled}</div>
+              </div>
+              <div>
+                <div className="text-[11px] text-subtle">{fa ? "فعال/کمین" : "Active"}</div>
+                <div className="text-muted">{c.data.pending + c.data.watch}</div>
+              </div>
+            </div>
+            {c.data.cancelReasons.length ? (
+              <div className="mt-2.5 flex flex-wrap gap-1.5 border-t border-border/60 pt-2">
+                {c.data.cancelReasons.slice(0, 4).map((cr) => (
+                  <span
+                    key={cr.reason}
+                    className="rounded-sm border border-border bg-surface px-1.5 py-0.5 text-[11px] text-muted"
+                  >
+                    {limitCancelLabel(cr.reason, fa)}: <span className="font-mono tabular text-fg">{cr.count}</span>
+                  </span>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function SideCell({ side, fa }: { side: string; fa: boolean }) {
   const long = side === "long";
   return <Badge tone={long ? "long" : "short"}>{long ? (fa ? "لانگ" : "long") : fa ? "شورت" : "short"}</Badge>;
@@ -455,6 +657,10 @@ function reasonLabel(reason: string, fa: boolean) {
   if (reason === "sl") return fa ? "استاپ" : "SL";
   if (reason === "tp") return fa ? "تارگت" : "TP";
   if (reason === "be") return fa ? "ورود" : "BE";
+  if (reason === "liq") return fa ? "لیکوئید" : "Liq";
+  if (reason === "excess trim") return fa ? "بستن مازاد" : "Trim";
+  if (reason === "venue") return fa ? "صرافی" : "Venue";
+  if (reason === "other") return fa ? "سایر" : "Other";
   return reason;
 }
 
@@ -476,7 +682,7 @@ function comboLabel(key: string, fa: boolean) {
   const parts = key.split(" · ");
   if (parts.length < 3) return sliceKey(key, fa);
   const [ind, tf, side] = parts;
-  return `${ind} · ${tf} · ${sliceKey(side ?? "", fa)}`;
+  return `${indicatorLabel(ind ?? "") || ind} · ${tf} · ${sliceKey(side ?? "", fa)}`;
 }
 
 function FindingRow({ f, fa }: { f: Finding; fa: boolean }) {
@@ -513,6 +719,22 @@ function findingText(f: Finding, fa: boolean, side: string): { title: string; de
       return {
         title: fa ? `فقط ${f.n} نمونه — برای قضاوت موتور کم است.` : `Only ${f.n} fills — thin sample.`,
         detail: "",
+      };
+    case "origin_strong":
+      return {
+        title: fa
+          ? `ورود با ${combo} بهترین بازده را داشته: ${fmtR(f.r ?? 0)} خالص، برد ${fmtPct(f.pct ?? 0)}.`
+          : `${combo} led entry performance: ${fmtR(f.r ?? 0)} net, ${fmtPct(f.pct ?? 0)} win rate.`,
+        detail: fa ? `${f.n} معامله با این نحوه ورود.` : `${f.n} fills from this entry type.`,
+      };
+    case "origin_weak":
+      return {
+        title: fa
+          ? `ورود با ${combo} ضررده بوده: ${fmtR(f.r ?? 0)} خالص (${fmtPct(f.pct ?? 0)} استاپ).`
+          : `${combo} is leaking: ${fmtR(f.r ?? 0)} net (${fmtPct(f.pct ?? 0)} stopped).`,
+        detail: fa
+          ? `${f.n} معامله. می‌توانی این حالت را از تنظیمات موتورها محدود کنی.`
+          : `${f.n} fills. You can tighten or disable this phase in Engines.`,
       };
     case "combo_sl_heavy":
       return {
@@ -577,7 +799,7 @@ function findingText(f: Finding, fa: boolean, side: string): { title: string; de
       };
     case "tiny_profit":
       return {
-        title: fa ? `${fmtPct(f.pct ?? 0)} از نمونه‌ها سود نداده‌اند.` : `${fmtPct(f.pct ?? 0)} of samples paid nothing.`,
+        title: fa ? `${fmtPct(f.pct ?? 0)} از نمونه‌ها سود خالص نداده‌اند.` : `${fmtPct(f.pct ?? 0)} of samples paid no net profit.`,
         detail: "",
       };
     case "giveback_heavy":
@@ -633,7 +855,7 @@ function SliceTable({ title, rows, fa }: { title: string; rows: SliceStats[]; fa
     <section className="rounded-lg border border-border bg-surface shadow-panel">
       <h2 className="border-b border-border px-3 py-2 text-sm font-medium">{title}</h2>
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[640px] text-sm">
+        <table className="w-full min-w-[700px] text-sm">
           <thead className="text-xs text-subtle">
             <tr className="border-b border-border">
               <th className="px-3 py-2 text-start font-medium">{fa ? "دسته" : "Batch"}</th>
@@ -643,12 +865,13 @@ function SliceTable({ title, rows, fa }: { title: string; rows: SliceStats[]; fa
               <th className="px-3 py-2 text-start font-medium">{fa ? "مرده" : "Dead"}</th>
               <th className="px-3 py-2 text-start font-medium">ΣR</th>
               <th className="px-3 py-2 text-start font-medium">E[R]</th>
+              <th className="px-3 py-2 text-start font-medium">Σ$</th>
             </tr>
           </thead>
           <tbody className="font-mono tabular">
             {!rows.length ? (
               <tr>
-                <td colSpan={7} className="px-3 py-6 text-sm text-muted">
+                <td colSpan={8} className="px-3 py-6 text-sm text-muted">
                   {fa ? "دسته‌ای در این برش نیست." : "No batches in this cut."}
                 </td>
               </tr>
@@ -662,6 +885,7 @@ function SliceTable({ title, rows, fa }: { title: string; rows: SliceStats[]; fa
                   <td className={r.deadPct >= 50 ? "px-3 py-2 text-warn" : "px-3 py-2"}>{fmtPct(r.deadPct)}</td>
                   <td className={r.netR >= 0 ? "px-3 py-2 text-long" : "px-3 py-2 text-short"}>{fmtR(r.netR)}</td>
                   <td className={r.expectR >= 0 ? "px-3 py-2 text-long" : "px-3 py-2 text-short"}>{fmtR(r.expectR)}</td>
+                  <td className={r.netUsd >= 0 ? "px-3 py-2 text-long" : "px-3 py-2 text-short"}>{fmtUsd(r.netUsd)}</td>
                 </tr>
               ))
             )}
@@ -673,14 +897,21 @@ function SliceTable({ title, rows, fa }: { title: string; rows: SliceStats[]; fa
 }
 
 function sliceKey(key: string, fa: boolean) {
+  if (key === "pre_arm") return fa ? "پیش‌لیمیت" : "Pre-Arm";
+  if (key === "armed_limit") return fa ? "لیمیت FTC" : "FTC Limit";
+  if (key === "market") return fa ? "مارکت" : "Market";
   if (key === "long") return fa ? "لانگ" : "long";
   if (key === "short") return fa ? "شورت" : "short";
   if (key === "sl") return fa ? "استاپ" : "SL";
   if (key === "tp") return fa ? "تارگت" : "TP";
   if (key === "be") return fa ? "ورود (BE)" : "BE";
+  if (key === "liq") return fa ? "لیکوئید" : "Liq";
+  if (key === "excess trim") return fa ? "بستن مازاد" : "Excess trim";
+  if (key === "venue") return fa ? "صرافی" : "Venue";
+  if (key === "other") return fa ? "سایر" : "Other";
   if (key === "paper") return fa ? "کاغذی" : "paper";
   if (key === "live") return fa ? "واقعی" : "live";
-  return key;
+  return indicatorLabel(key) || key;
 }
 
 function TradeList({
@@ -710,6 +941,7 @@ function TradeList({
               <div className="flex items-center justify-between gap-2">
                 <div className="flex flex-wrap items-center gap-1.5">
                   <SideCell side={tr.side} fa={fa} />
+                  <EntryOriginBadge reason={tr.entryWhy} />
                   <span className="text-xs text-muted">
                     {tr.indicator ? indicatorLabel(tr.indicator as never) || tr.indicator : ""} {tr.timeframe ?? ""}
                   </span>
@@ -727,7 +959,8 @@ function TradeList({
                 {showGiveback ? ` · ${fa ? "برگشت" : "giveback"} ${fmtR(tr.givebackR)}` : ""}
               </div>
               <div className="text-[11px] text-subtle">
-                MAE {fmtR(tr.maeR)} · MFE {fmtR(tr.mfeR)} · {fmtUsd(tr.pnl)}
+                {tr.hasExcursion ? `MAE ${fmtR(tr.maeR)} · MFE ${fmtR(tr.mfeR)} · ` : ""}
+                {fmtUsd(tr.pnl)}
               </div>
               <div className="truncate text-[11px] text-muted" title={tr.entryWhy}>
                 {tr.entryWhy}

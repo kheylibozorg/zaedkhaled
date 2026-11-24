@@ -10,6 +10,7 @@ import {
   clearUniverse,
   getLimitOrderById,
   getSettings,
+  listAnalyzeLimitOrders,
   listClosedPositions,
   listEquity,
   listOpenPositions,
@@ -383,6 +384,19 @@ export const getJournal = createServerFn({ method: "GET" }).handler(async () => 
   ]);
   const live = await overlayLiveSnapshot(settings, openRaw);
   return { settings: live.settings, lock, open: live.open, closed, stats: st };
+});
+
+export const getBacktestAnalyze = createServerFn({ method: "GET" }).handler(async () => {
+  const lock = await lockStatus();
+  const settings = publicSettings(await getSettings(), { unlocked: lock.unlocked });
+  const [openRaw, closed, limitOrders, st] = await Promise.all([
+    listOpenPositions(),
+    listClosedPositions(5000),
+    listAnalyzeLimitOrders(2000),
+    stats(),
+  ]);
+  const live = await overlayLiveSnapshot(settings, openRaw);
+  return { settings: live.settings, lock, open: live.open, closed, limitOrders, stats: st };
 });
 
 export const resetDeskJournal = createServerFn({ method: "POST" })

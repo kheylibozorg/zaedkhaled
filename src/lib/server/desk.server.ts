@@ -1016,6 +1016,22 @@ export async function listRecentLimitOrders(limit = 60): Promise<LimitOrderRow[]
   }
 }
 
+export async function listAnalyzeLimitOrders(limit = 2000): Promise<LimitOrderRow[]> {
+  const sql = await getSql();
+  await ensureTickHardeningColumns(sql);
+  try {
+    return await sql<LimitOrderRow>`
+      select * from limit_orders
+      order by updated_at desc, id desc
+      limit ${limit}
+    `;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/limit_orders|does not exist/i.test(msg)) return [];
+    throw err;
+  }
+}
+
 export async function getLimitOrderById(id: number): Promise<LimitOrderRow | null> {
   const sql = await getSql();
   await ensureTickHardeningColumns(sql);

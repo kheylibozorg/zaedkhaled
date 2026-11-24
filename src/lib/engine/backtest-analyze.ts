@@ -1,6 +1,9 @@
-import type { JournalTrade } from "./journal.ts";
+import { DEMO_JOURNAL } from "./demo-journal.ts";
+import { entryOriginOf, type EntryOrigin, type JournalTrade } from "./journal.ts";
 import { pathExcursion, type PaperExit } from "./paper.ts";
 import type { Bar, Side, Signal } from "./types.ts";
+
+export type ExitReason = "sl" | "tp" | "be" | "liq" | "venue" | "excess trim" | "other";
 
 export type AnalyzedTrade = {
   i: number;
@@ -9,14 +12,19 @@ export type AnalyzedTrade = {
   sl: number;
   tp: number;
   exit: number;
-  reason: "sl" | "tp" | "be";
+  reason: ExitReason;
+  rawExitReason?: string;
+  entryOrigin: EntryOrigin;
   pnlR: number;
   pnl: number;
+  feesUsd: number;
   maeR: number;
   mfeR: number;
+  hasExcursion: boolean;
   capture: number | null;
   givebackR: number;
   barsHeld: number;
+  hasBarsHeld: boolean;
   holdMs: number;
   plannedRr: number;
   entryWhy: string;
@@ -40,8 +48,12 @@ export type SliceStats = {
   sl: number;
   tp: number;
   be: number;
+  liq: number;
   wr: number;
   netR: number;
+  netUsd: number;
+  feesUsd: number;
+  profitFactor: number;
   expectR: number;
   avgWinR: number;
   avgLossR: number;
@@ -68,6 +80,8 @@ export type Finding = {
     | "combo_strong"
     | "combo_weak"
     | "combo_dead"
+    | "origin_strong"
+    | "origin_weak"
     | "side_sl_heavy"
     | "side_strong"
     | "side_weak"
@@ -94,10 +108,16 @@ export type BacktestAnalysis = {
   slN: number;
   tpN: number;
   beN: number;
+  liqN: number;
+  trimN: number;
+  venueN: number;
   slPct: number;
   tpPct: number;
   wr: number;
   netR: number;
+  netUsd: number;
+  feesUsd: number;
+  profitFactor: number;
   expectR: number;
   avgWinR: number;
   avgLossR: number;
@@ -105,10 +125,12 @@ export type BacktestAnalysis = {
   avgMfe: number;
   avgCapture: number;
   avgHoldBars: number;
+  excursionSampleN: number;
   scratchN: number;
   noProfitN: number;
   stoppedFromProfitN: number;
   missedTpN: number;
+  byEntryOrigin: SliceStats[];
   bySide: SliceStats[];
   byReason: SliceStats[];
   byEntry: SliceStats[];
@@ -125,6 +147,38 @@ export type BacktestAnalysis = {
   all: AnalyzedTrade[];
 };
 
+export type LimitOrderAnalyzeRow = {
+  id: number;
+  mode: string;
+  venue: string;
+  symbol: string;
+  timeframe: string;
+  indicator: string;
+  side: string;
+  status: string;
+  cancel_reason?: string | null;
+  reason?: string | null;
+  distance_atr?: number | null;
+};
+
+export type LimitOriginFunnel = {
+  origin: "all" | "pre_arm" | "armed_limit";
+  total: number;
+  pending: number;
+  watch: number;
+  filled: number;
+  cancelled: number;
+  resolved: number;
+  fillRatePct: number;
+  cancelReasons: Array<{ reason: string; count: number }>;
+};
+
+export type LimitFunnelSummary = {
+  all: LimitOriginFunnel;
+  preArm: LimitOriginFunnel;
+  armedLimit: LimitOriginFunnel;
+};
+
 export const R_HIST: Array<{ key: string; lo: number; hi: number }> = [
   { key: "lt-2", lo: Number.NEGATIVE_INFINITY, hi: -2 },
   { key: "-2--1", lo: -2, hi: -1 },
@@ -138,6 +192,21 @@ export const R_HIST: Array<{ key: string; lo: number; hi: number }> = [
 const SCRATCH_R = 0.3;
 const PROFIT_MFE = 0.35;
 
+const DEMO_SIGNATURES = new Set(
+  DEMO_JOURNAL.map(
+    (d) => `${d.symbol}|${d.timeframe}|${d.indicator}|${d.side}|${d.reason}|${Number(d.entry).toPrecision(8)}`,
+  ),
+);
+
+/** Detects rows inserted by `seedDemoJournal()` so synthetic preview records never pollute real analysis metrics. */
+export function isDemoSampleTrade(
+  row: Pick<JournalTrade, "symbol" | "timeframe" | "indicator" | "side" | "entry" | "signal_reason" | "exchange_order_id">,
+): boolean {
+  if (row.exchange_order_id) return false;
+  const sig = `${row.symbol}|${row.timeframe}|${row.indicator}|${row.side}|${row.signal_reason ?? ""}|${Number(row.entry).toPrecision(8)}`;
+  return DEMO_SIGNATURES.has(sig);
+}
+
 function num(v: unknown, d = 0) {
   const n = typeof v === "number" ? v : Number(v);
   return Number.isFinite(n) ? n : d;
@@ -147,6 +216,12 @@ function avg(xs: number[]) {
   return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0;
 }
 
+/** Matches Journal net post-fee outcome: if net USD is non-zero, net USD decides win vs loss. */
+function isNetWin(t: Pick<AnalyzedTrade, "pnl" | "pnlR">): boolean {
+  if (Number.isFinite(t.pnl) && t.pnl !== 0) return t.pnl > 0;
+  return t.pnlR > 0;
+}
+
 function origSlOf(t: PaperExit) {
   const extra = t as PaperExit & { origSl?: number };
   const orig = Number(extra.origSl);
@@ -154,17 +229,37 @@ function origSlOf(t: PaperExit) {
   return t.sl;
 }
 
+function calcProfitFactor(wins: AnalyzedTrade[], losses: AnalyzedTrade[]): number {
+  const hasUsd = wins.some((t) => t.pnl !== 0) || losses.some((t) => t.pnl !== 0);
+  if (hasUsd) {
+    const gw = wins.reduce((a, t) => a + Math.max(0, t.pnl), 0);
+    const gl = Math.abs(losses.reduce((a, t) => a + Math.min(0, t.pnl), 0));
+    if (gl > 0) return gw / gl;
+    return gw > 0 ? 99 : 0;
+  }
+  const gwR = wins.reduce((a, t) => a + Math.max(0, t.pnlR), 0);
+  const glR = Math.abs(losses.reduce((a, t) => a + Math.min(0, t.pnlR), 0));
+  if (glR > 0) return gwR / glR;
+  return gwR > 0 ? 99 : 0;
+}
+
 function sliceOf(key: string, rows: AnalyzedTrade[]): SliceStats {
   const n = rows.length;
-  const wins = rows.filter((t) => t.pnlR > 0);
-  const losses = rows.filter((t) => t.pnlR <= 0);
+  const wins = rows.filter(isNetWin);
+  const losses = rows.filter((t) => !isNetWin(t));
   const sl = rows.filter((t) => t.reason === "sl").length;
+  const liq = rows.filter((t) => t.reason === "liq").length;
   const tp = rows.filter((t) => t.reason === "tp").length;
   const be = rows.filter((t) => t.reason === "be").length;
   const netR = rows.reduce((a, t) => a + t.pnlR, 0);
-  const caps = rows.map((t) => t.capture).filter((v): v is number => v != null);
+  const netUsd = rows.reduce((a, t) => a + t.pnl, 0);
+  const feesUsd = rows.reduce((a, t) => a + t.feesUsd, 0);
+  const excRows = rows.filter((t) => t.hasExcursion);
+  const barRows = rows.filter((t) => t.hasBarsHeld);
+  const caps = excRows.map((t) => t.capture).filter((v): v is number => v != null);
   const scratchN = rows.filter((t) => t.scratch).length;
-  const deadN = rows.filter((t) => t.pnlR < SCRATCH_R).length;
+  const deadN = rows.filter((t) => !isNetWin(t) || t.pnlR < SCRATCH_R).length;
+  const stopFailures = sl + liq;
   return {
     key,
     n,
@@ -173,16 +268,20 @@ function sliceOf(key: string, rows: AnalyzedTrade[]): SliceStats {
     sl,
     tp,
     be,
+    liq,
     wr: n ? (100 * wins.length) / n : 0,
     netR,
+    netUsd,
+    feesUsd,
+    profitFactor: calcProfitFactor(wins, losses),
     expectR: n ? netR / n : 0,
     avgWinR: avg(wins.map((t) => t.pnlR)),
     avgLossR: avg(losses.map((t) => t.pnlR)),
-    avgMae: avg(rows.map((t) => t.maeR)),
-    avgMfe: avg(rows.map((t) => t.mfeR)),
+    avgMae: avg(excRows.map((t) => t.maeR)),
+    avgMfe: avg(excRows.map((t) => t.mfeR)),
     avgCapture: avg(caps),
-    avgHoldBars: avg(rows.map((t) => t.barsHeld)),
-    slPct: n ? (100 * sl) / n : 0,
+    avgHoldBars: avg(barRows.map((t) => t.barsHeld)),
+    slPct: n ? (100 * stopFailures) / n : 0,
     maxWinR: wins.reduce((a, t) => Math.max(a, t.pnlR), 0),
     maxLossR: losses.reduce((a, t) => Math.min(a, t.pnlR), 0),
     scratchN,
@@ -210,8 +309,13 @@ function comboKey(t: AnalyzedTrade) {
   return `${t.indicator} · ${t.timeframe} · ${t.side}`;
 }
 
-function exitReason(raw: string | null | undefined, pnlR: number): AnalyzedTrade["reason"] {
-  if (raw === "tp" || raw === "be" || raw === "sl") return raw;
+function exitReason(raw: string | null | undefined, pnlR: number): ExitReason {
+  const norm = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (norm === "tp" || norm === "be" || norm === "sl" || norm === "liq" || norm === "venue" || norm === "excess trim") {
+    return norm;
+  }
+  if (norm === "flatten retry") return "venue";
+  if (norm) return "other";
   if (pnlR > 0.3) return "tp";
   if (Math.abs(pnlR) < 0.05) return "be";
   return "sl";
@@ -222,20 +326,31 @@ export function journalToAnalyzed(rows: JournalTrade[]): AnalyzedTrade[] {
     .filter((r) => r.status === "closed")
     .map((r, i) => {
       const side: Side = r.side === "short" ? "short" : "long";
-      const pnlR = num(r.pnl_r);
-      const pnl = num(r.pnl_usd);
+      const riskUsd = num(r.risk_usd);
+      const rawPnlUsd = r.pnl_usd != null && Number.isFinite(Number(r.pnl_usd)) ? Number(r.pnl_usd) : null;
+      const rawPnlR = r.pnl_r != null && Number.isFinite(Number(r.pnl_r)) ? Number(r.pnl_r) : null;
+      const pnl = rawPnlUsd ?? (rawPnlR != null ? rawPnlR * riskUsd : 0);
+      const pnlR = rawPnlR ?? (rawPnlUsd != null && riskUsd > 0 ? rawPnlUsd / riskUsd : 0);
+      const feesUsd = num(r.fees_usd);
       const entry = num(r.entry);
       const orig = num(r.orig_sl) || num(r.sl);
       const tp = num(r.tp);
       const exit = num(r.exit_px, entry);
-      const maeR = num(r.mae_r);
-      const mfeR = num(r.mfe_r);
+      const hasExcursion =
+        r.mae_r != null && Number.isFinite(Number(r.mae_r)) && r.mfe_r != null && Number.isFinite(Number(r.mfe_r));
+      const maeR = hasExcursion ? num(r.mae_r) : 0;
+      const mfeR = hasExcursion ? num(r.mfe_r) : 0;
+      const hasBarsHeld = r.bars_held != null && Number.isFinite(Number(r.bars_held));
+      const barsHeld = hasBarsHeld ? Math.max(1, num(r.bars_held, 1)) : 1;
       const reason = exitReason(r.exit_reason, pnlR);
       const dist = Math.abs(entry - orig);
       const plannedRr = num(r.rr_planned) || (dist > 0 ? Math.abs(tp - entry) / dist : 0);
-      const capture = mfeR > 0.05 ? Math.max(0, pnlR) / mfeR : null;
+      const capture = hasExcursion && mfeR > 0.05 ? Math.max(0, pnlR) / mfeR : null;
       const opened = Date.parse(r.opened_at) || num(r.bar_time);
       const closed = r.closed_at ? Date.parse(r.closed_at) : opened;
+      const netWin = pnl !== 0 ? pnl > 0 : pnlR > 0;
+      const entryWhy = r.signal_reason || r.indicator || "—";
+      const entryOrigin = entryOriginOf(r.signal_reason);
       return {
         i,
         side,
@@ -244,22 +359,27 @@ export function journalToAnalyzed(rows: JournalTrade[]): AnalyzedTrade[] {
         tp,
         exit,
         reason,
+        rawExitReason: r.exit_reason ?? undefined,
+        entryOrigin,
         pnlR,
         pnl,
+        feesUsd,
         maeR,
         mfeR,
+        hasExcursion,
         capture,
-        givebackR: Math.max(0, mfeR - Math.max(pnlR, 0)),
-        barsHeld: Math.max(1, num(r.bars_held, 1)),
+        givebackR: hasExcursion ? Math.max(0, mfeR - Math.max(pnlR, 0)) : 0,
+        barsHeld,
+        hasBarsHeld,
         holdMs: num(r.hold_ms) || Math.max(0, closed - opened),
         plannedRr,
-        entryWhy: r.signal_reason || r.indicator || "—",
+        entryWhy,
         opened,
         closed,
-        scratch: pnlR > 0 && pnlR < SCRATCH_R,
-        noProfit: pnlR <= 0,
-        stoppedFromProfit: reason !== "tp" && mfeR >= PROFIT_MFE && pnlR < PROFIT_MFE,
-        missedTp: reason === "sl" && plannedRr > 0 && mfeR >= plannedRr * 0.85,
+        scratch: netWin && pnlR > 0 && pnlR < SCRATCH_R,
+        noProfit: !netWin,
+        stoppedFromProfit: hasExcursion && reason !== "tp" && mfeR >= PROFIT_MFE && pnlR < PROFIT_MFE,
+        missedTp: hasExcursion && (reason === "sl" || reason === "liq") && plannedRr > 0 && mfeR >= plannedRr * 0.85,
         indicator: r.indicator,
         timeframe: r.timeframe,
         symbol: r.symbol,
@@ -285,8 +405,10 @@ export function enrichTrades(trades: PaperExit[], bars: Bar[], signals: Signal[]
     const plannedRr = dist > 0 ? Math.abs(t.tp - t.entry) / dist : 0;
     const capture = mfeR > 0.05 ? Math.max(0, t.pnlR) / mfeR : null;
     const givebackR = Math.max(0, mfeR - Math.max(t.pnlR, 0));
-    const scratch = t.pnlR > 0 && t.pnlR < SCRATCH_R;
-    const noProfit = t.pnlR <= 0;
+    const entryWhy = whyOf(t);
+    const netWin = t.pnl !== 0 ? t.pnl > 0 : t.pnlR > 0;
+    const scratch = netWin && t.pnlR > 0 && t.pnlR < SCRATCH_R;
+    const noProfit = !netWin;
     const stoppedFromProfit = t.reason !== "tp" && mfeR >= PROFIT_MFE && t.pnlR < PROFIT_MFE;
     const missedTp = t.reason === "sl" && plannedRr > 0 && mfeR >= plannedRr * 0.85;
     return {
@@ -297,16 +419,21 @@ export function enrichTrades(trades: PaperExit[], bars: Bar[], signals: Signal[]
       tp: t.tp,
       exit: t.exit,
       reason: t.reason,
+      rawExitReason: t.reason,
+      entryOrigin: entryOriginOf(entryWhy),
       pnlR: t.pnlR,
       pnl: t.pnl,
+      feesUsd: 0,
       maeR,
       mfeR,
+      hasExcursion: true,
       capture,
       givebackR,
       barsHeld: Math.max(1, ci - oi),
+      hasBarsHeld: true,
       holdMs: Math.max(0, t.closedBarTime - t.openedBarTime),
       plannedRr,
-      entryWhy: whyOf(t),
+      entryWhy,
       opened: t.openedBarTime,
       closed: t.closedBarTime,
       scratch,
@@ -320,17 +447,27 @@ export function enrichTrades(trades: PaperExit[], bars: Bar[], signals: Signal[]
   });
 }
 
+const ORIGIN_ORDER: EntryOrigin[] = ["pre_arm", "armed_limit", "market"];
+const REASON_ORDER: ExitReason[] = ["sl", "tp", "be", "liq", "excess trim", "venue", "other"];
+
 export function analyzeBacktest(trades: AnalyzedTrade[], signalCount = 0): BacktestAnalysis {
   const n = trades.length;
-  const wins = trades.filter((t) => t.pnlR > 0);
-  const losses = trades.filter((t) => t.pnlR <= 0);
+  const wins = trades.filter(isNetWin);
+  const losses = trades.filter((t) => !isNetWin(t));
   const slN = trades.filter((t) => t.reason === "sl").length;
   const tpN = trades.filter((t) => t.reason === "tp").length;
   const beN = trades.filter((t) => t.reason === "be").length;
+  const liqN = trades.filter((t) => t.reason === "liq").length;
+  const trimN = trades.filter((t) => t.reason === "excess trim").length;
+  const venueN = trades.filter((t) => t.reason === "venue").length;
   const netR = trades.reduce((a, t) => a + t.pnlR, 0);
-  const caps = trades.map((t) => t.capture).filter((v): v is number => v != null);
+  const netUsd = trades.reduce((a, t) => a + t.pnl, 0);
+  const feesUsd = trades.reduce((a, t) => a + (t.feesUsd ?? 0), 0);
+  const excRows = trades.filter((t) => t.hasExcursion !== false);
+  const barRows = trades.filter((t) => t.hasBarsHeld !== false);
+  const caps = excRows.map((t) => t.capture).filter((v): v is number => v != null);
   const scratchN = trades.filter((t) => t.scratch).length;
-  const noProfitN = trades.filter((t) => t.noProfit).length;
+  const noProfitN = trades.filter((t) => t.noProfit || !isNetWin(t)).length;
   const stoppedFromProfitN = trades.filter((t) => t.stoppedFromProfit).length;
   const missedTpN = trades.filter((t) => t.missedTp).length;
 
@@ -341,9 +478,14 @@ export function analyzeBacktest(trades: AnalyzedTrade[], signalCount = 0): Backt
     short.length ? sliceOf("short", short) : null,
   ].filter((x): x is SliceStats => Boolean(x));
 
-  const byReason = (["sl", "tp", "be"] as const)
-    .map((k) => sliceOf(k, trades.filter((t) => t.reason === k)))
-    .filter((s) => s.n > 0);
+  const byEntryOrigin = ORIGIN_ORDER.map((k) =>
+    sliceOf(
+      k,
+      trades.filter((t) => (t.entryOrigin ?? entryOriginOf(t.entryWhy)) === k),
+    ),
+  ).filter((s) => s.n > 0);
+
+  const byReason = REASON_ORDER.map((k) => sliceOf(k, trades.filter((t) => t.reason === k))).filter((s) => s.n > 0);
 
   const hist: HistBar[] = R_HIST.map((h) => ({ ...h, n: 0 }));
   for (const t of trades) {
@@ -357,21 +499,29 @@ export function analyzeBacktest(trades: AnalyzedTrade[], signalCount = 0): Backt
     slN,
     tpN,
     beN,
-    slPct: n ? (100 * slN) / n : 0,
+    liqN,
+    trimN,
+    venueN,
+    slPct: n ? (100 * (slN + liqN)) / n : 0,
     tpPct: n ? (100 * tpN) / n : 0,
     wr: n ? (100 * wins.length) / n : 0,
     netR,
+    netUsd,
+    feesUsd,
+    profitFactor: calcProfitFactor(wins, losses),
     expectR: n ? netR / n : 0,
     avgWinR: avg(wins.map((t) => t.pnlR)),
     avgLossR: avg(losses.map((t) => t.pnlR)),
-    avgMae: avg(trades.map((t) => t.maeR)),
-    avgMfe: avg(trades.map((t) => t.mfeR)),
+    avgMae: avg(excRows.map((t) => t.maeR)),
+    avgMfe: avg(excRows.map((t) => t.mfeR)),
     avgCapture: avg(caps),
-    avgHoldBars: avg(trades.map((t) => t.barsHeld)),
+    avgHoldBars: avg(barRows.map((t) => t.barsHeld)),
+    excursionSampleN: excRows.length,
     scratchN,
     noProfitN,
     stoppedFromProfitN,
     missedTpN,
+    byEntryOrigin,
     bySide,
     byReason,
     byEntry: grouped(trades, (t) => t.entryWhy || "—"),
@@ -381,17 +531,17 @@ export function analyzeBacktest(trades: AnalyzedTrade[], signalCount = 0): Backt
     byMode: grouped(trades, (t) => t.mode || null),
     hist,
     worstStops: trades
-      .filter((t) => t.reason === "sl")
+      .filter((t) => t.reason === "sl" || t.reason === "liq")
       .slice()
       .sort((a, b) => a.pnlR - b.pnlR)
       .slice(0, 8),
     bestWins: trades
-      .filter((t) => t.pnlR > 0)
+      .filter(isNetWin)
       .slice()
       .sort((a, b) => b.pnlR - a.pnlR)
       .slice(0, 8),
     scratches: trades
-      .filter((t) => t.scratch || (t.pnlR >= 0 && t.pnlR < SCRATCH_R))
+      .filter((t) => t.scratch || (isNetWin(t) && t.pnlR >= 0 && t.pnlR < SCRATCH_R))
       .slice()
       .sort((a, b) => a.pnlR - b.pnlR)
       .slice(0, 8),
@@ -407,6 +557,71 @@ export function analyzeBacktest(trades: AnalyzedTrade[], signalCount = 0): Backt
   return analysis;
 }
 
+export function analyzeLimitFunnel(
+  orders: LimitOrderAnalyzeRow[],
+  q: {
+    mode?: string;
+    indicator?: string;
+    timeframe?: string;
+    side?: string;
+    entryOrigin?: string;
+  } = {},
+): LimitFunnelSummary {
+  const filtered = orders.filter((o) => {
+    if (q.mode && q.mode !== "all" && o.mode !== q.mode) return false;
+    if (q.indicator && q.indicator !== "all" && o.indicator !== q.indicator) return false;
+    if (q.timeframe && q.timeframe !== "all" && o.timeframe !== q.timeframe) return false;
+    if (q.side && q.side !== "all" && o.side !== q.side) return false;
+    const origin = entryOriginOf(o.reason);
+    if (q.entryOrigin && q.entryOrigin !== "all" && origin !== q.entryOrigin) return false;
+    return true;
+  });
+
+  const build = (origin: "all" | "pre_arm" | "armed_limit", rows: LimitOrderAnalyzeRow[]): LimitOriginFunnel => {
+    let pending = 0;
+    let watch = 0;
+    let filled = 0;
+    let cancelled = 0;
+    const reasonCounts = new Map<string, number>();
+    for (const r of rows) {
+      if (r.status === "pending") pending += 1;
+      else if (r.status === "watch") watch += 1;
+      else if (r.status === "filled") filled += 1;
+      else if (r.status === "cancelled") {
+        cancelled += 1;
+        const why = (r.cancel_reason ?? "cancelled").trim() || "cancelled";
+        reasonCounts.set(why, (reasonCounts.get(why) ?? 0) + 1);
+      }
+    }
+    const resolved = filled + cancelled;
+    return {
+      origin,
+      total: rows.length,
+      pending,
+      watch,
+      filled,
+      cancelled,
+      resolved,
+      fillRatePct: resolved > 0 ? (100 * filled) / resolved : 0,
+      cancelReasons: [...reasonCounts.entries()]
+        .map(([reason, count]) => ({ reason, count }))
+        .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason)),
+    };
+  };
+
+  return {
+    all: build("all", filtered),
+    preArm: build(
+      "pre_arm",
+      filtered.filter((o) => entryOriginOf(o.reason) === "pre_arm"),
+    ),
+    armedLimit: build(
+      "armed_limit",
+      filtered.filter((o) => entryOriginOf(o.reason) !== "pre_arm"),
+    ),
+  };
+}
+
 function buildFindings(a: BacktestAnalysis): Finding[] {
   const out: Finding[] = [];
   if (!a.n) {
@@ -415,6 +630,32 @@ function buildFindings(a: BacktestAnalysis): Finding[] {
   }
   if (a.n < 8) out.push({ severity: "warn", kind: "few_trades", n: a.n });
 
+  const origins = a.byEntryOrigin.filter((s) => s.n >= 2);
+  if (origins.length >= 2) {
+    const bestOrig = [...origins].sort((x, y) => y.expectR - x.expectR || y.netR - x.netR)[0];
+    if (bestOrig && bestOrig.expectR > 0) {
+      out.push({
+        severity: "good",
+        kind: "origin_strong",
+        extra: bestOrig.key,
+        n: bestOrig.n,
+        r: bestOrig.netR,
+        pct: bestOrig.wr,
+      });
+    }
+    const weakOrig = [...origins].sort((x, y) => x.expectR - y.expectR || x.netR - y.netR)[0];
+    if (weakOrig && weakOrig.netR < 0 && weakOrig.key !== bestOrig?.key) {
+      out.push({
+        severity: "bad",
+        kind: "origin_weak",
+        extra: weakOrig.key,
+        n: weakOrig.n,
+        r: weakOrig.netR,
+        pct: weakOrig.slPct,
+      });
+    }
+  }
+
   const combos = a.byCombo.filter((s) => s.n >= 2);
   const slCombo = [...combos].sort((x, y) => y.slPct - x.slPct || y.n - x.n)[0];
   if (slCombo && slCombo.slPct >= 50) {
@@ -422,7 +663,7 @@ function buildFindings(a: BacktestAnalysis): Finding[] {
       severity: slCombo.slPct >= 70 ? "bad" : "warn",
       kind: "combo_sl_heavy",
       extra: slCombo.key,
-      n: slCombo.sl,
+      n: slCombo.sl + slCombo.liq,
       pct: slCombo.slPct,
       r: slCombo.netR,
     });
@@ -466,7 +707,7 @@ function buildFindings(a: BacktestAnalysis): Finding[] {
       severity: slHeavy.slPct >= 70 ? "bad" : "warn",
       kind: "side_sl_heavy",
       side: slHeavy.key as Side,
-      n: slHeavy.sl,
+      n: slHeavy.sl + slHeavy.liq,
       pct: slHeavy.slPct,
     });
   }
@@ -495,7 +736,7 @@ function buildFindings(a: BacktestAnalysis): Finding[] {
     });
   }
 
-  if (a.slPct >= 60) out.push({ severity: "bad", kind: "sl_rate_high", pct: a.slPct, n: a.slN });
+  if (a.slPct >= 60) out.push({ severity: "bad", kind: "sl_rate_high", pct: a.slPct, n: a.slN + a.liqN });
 
   if (a.n && a.scratchN / a.n >= 0.15) {
     out.push({
