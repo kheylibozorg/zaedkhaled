@@ -37,7 +37,7 @@ export type TrexProfile = {
 const TREX1: TrexProfile = {
   name: "TREX1",
   rr: 1,
-  beAtR: 0.35,
+  beAtR: 1,
   legLookback: 40,
   minLegAtr: 2,
   coverMax: 2,
@@ -55,7 +55,7 @@ const TREX1: TrexProfile = {
 const TREX12: TrexProfile = {
   name: "TREX12",
   rr: 1.2,
-  beAtR: 0.32,
+  beAtR: 1,
   legLookback: 40,
   minLegAtr: 2.4,
   coverMax: 2,

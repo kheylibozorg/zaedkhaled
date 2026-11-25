@@ -359,14 +359,14 @@ function Home() {
             {
               k: "1.0R",
               name: "TREX 1.0R",
-              fa: "تست دوم پیوت زنده · ورود FTC · بعد از +۰.۳۵R استاپ به ورود · هر دو سمت",
-              en: "Second-test live pivot · FTC entry · stop to BE after +0.35R · both sides",
+              fa: "تست دوم پیوت زنده · ورود FTC · بعد از +۱R استاپ به ورود · هر دو سمت",
+              en: "Second-test live pivot · FTC entry · stop to BE after +1R · both sides",
             },
             {
               k: "1.2R",
               name: "TREX 1.2R",
-              fa: "همان اسکلت · تارگت ۱.۲R · BE@۰.۳۲R · لگ و اتاق سخت‌تر",
-              en: "Same skeleton · 1.2R target · BE@0.32R · stricter leg and room",
+              fa: "همان اسکلت · تارگت ۱.۲R · BE@۱R · لگ و اتاق سخت‌تر",
+              en: "Same skeleton · 1.2R target · BE@1R · stricter leg and room",
             },
             {
               k: "2.2R",

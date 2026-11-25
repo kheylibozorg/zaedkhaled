@@ -28,7 +28,7 @@ describe("TREX locked lab profiles", () => {
   it("1.0R matches the published 15m Pine", () => {
     const p = trexProfile("TREX1");
     assert.equal(p.rr, 1);
-    assert.equal(p.beAtR, 0.35);
+    assert.equal(p.beAtR, 1);
     assert.equal(p.minLegAtr, 2);
     assert.equal(p.slAtrMult, 0.35);
     assert.equal(p.ftcWait, 12);
@@ -41,21 +41,21 @@ describe("TREX locked lab profiles", () => {
     assert.equal(p.useLongbar, true);
     assert.equal(p.useHtfEma, true);
     assert.equal(p.legLookback, 40);
-    assert.equal(trexBeAtR("TREX1"), 0.35);
+    assert.equal(trexBeAtR("TREX1"), 1);
     assert.equal(trexBeAtR("APEX1"), null);
   });
 
-  it("1.2R matches the published 15m Pine", () => {
+  it("1.2R uses 1R break-even and matches the published 15m Pine profile", () => {
     const p = trexProfile("TREX12");
     assert.equal(p.rr, 1.2);
-    assert.equal(p.beAtR, 0.32);
+    assert.equal(p.beAtR, 1);
     assert.equal(p.minLegAtr, 2.4);
     assert.equal(p.minRoomR, 1.5);
     assert.equal(p.cooldownBars, 3);
     assert.equal(p.slAtrMult, 0.35);
     assert.equal(p.minStopPct, 0.5);
     assert.equal(p.minTpPct, 0.5);
-    assert.equal(trexBeAtR("TREX12"), 0.32);
+    assert.equal(trexBeAtR("TREX12"), 1);
   });
 
   it("does not emit on warmup and does not throw on a quiet walk", () => {
@@ -68,7 +68,7 @@ describe("TREX locked lab profiles", () => {
           assert.ok(s.barIndex >= 266);
           assert.equal(s.indicator, name);
           assert.ok(s.rr === 1 || s.rr === 1.2);
-          assert.equal(s.beAtR, name === "TREX12" ? 0.32 : 0.35);
+          assert.equal(s.beAtR, 1);
           assert.ok(s.entry > 0 && s.sl > 0 && s.tp > 0);
           if (s.side === "long") {
             assert.ok(s.sl < s.entry && s.tp > s.entry);
@@ -82,7 +82,7 @@ describe("TREX locked lab profiles", () => {
 });
 
 describe("TREX break-even execution", () => {
-  it("moves stop to entry after +0.35R and exits BE on the same bar if price tags entry", () => {
+  it("moves stop to entry after +1R on TREX12 (1.2R TP) and exits BE on the same bar if price tags entry", () => {
     const t0 = Date.UTC(2024, 0, 1);
     const bars: Bar[] = [];
     for (let i = 0; i < 12; i++) {
@@ -95,19 +95,19 @@ describe("TREX break-even execution", () => {
         volume: 1,
       });
     }
-    bars[6] = { time: bars[6]!.time, open: 100, high: 104, low: 99.9, close: 100, volume: 1 };
+    bars[6] = { time: bars[6]!.time, open: 100, high: 110.5, low: 99.9, close: 100, volume: 1 };
     const signals: Signal[] = [
       {
         barIndex: 5,
         barTime: bars[5]!.time,
-        indicator: "TREX1",
+        indicator: "TREX12",
         side: "long",
         entry: 100,
         sl: 90,
-        tp: 110,
-        rr: 1,
+        tp: 112,
+        rr: 1.2,
         atr: 1,
-        beAtR: 0.35,
+        beAtR: 1,
         reason: "test",
       },
     ];
@@ -125,7 +125,7 @@ describe("TREX break-even execution", () => {
     assert.ok(Math.abs(sim.trades[0]!.pnlR) < 1e-9);
   });
 
-  it("moves stop to entry after +0.35R and exits BE on the next bar if the BE bar holds", () => {
+  it("moves stop to entry after +1R and exits BE on the next bar if the BE bar holds", () => {
     const t0 = Date.UTC(2024, 0, 1);
     const bars: Bar[] = [];
     for (let i = 0; i < 12; i++) {
@@ -138,20 +138,20 @@ describe("TREX break-even execution", () => {
         volume: 1,
       });
     }
-    bars[6] = { time: bars[6]!.time, open: 100, high: 104, low: 100.1, close: 103.5, volume: 1 };
-    bars[7] = { time: bars[7]!.time, open: 103, high: 103.2, low: 99.9, close: 100, volume: 1 };
+    bars[6] = { time: bars[6]!.time, open: 100, high: 110.5, low: 100.1, close: 108, volume: 1 };
+    bars[7] = { time: bars[7]!.time, open: 108, high: 108.2, low: 99.9, close: 100, volume: 1 };
     const signals: Signal[] = [
       {
         barIndex: 5,
         barTime: bars[5]!.time,
-        indicator: "TREX1",
+        indicator: "TREX12",
         side: "long",
         entry: 100,
         sl: 90,
-        tp: 110,
-        rr: 1,
+        tp: 112,
+        rr: 1.2,
         atr: 1,
-        beAtR: 0.35,
+        beAtR: 1,
         reason: "test",
       },
     ];
@@ -167,6 +167,49 @@ describe("TREX break-even execution", () => {
     assert.equal(sim.trades[0]!.exit, 100);
     assert.equal(sim.trades[0]!.closedBarTime, bars[7]!.time);
     assert.ok(Math.abs(sim.trades[0]!.pnlR) < 1e-9);
+  });
+
+  it("does not trigger BE below +1R when beAtR is 1", () => {
+    const t0 = Date.UTC(2024, 0, 1);
+    const bars: Bar[] = [];
+    for (let i = 0; i < 12; i++) {
+      bars.push({
+        time: t0 + i * 60_000,
+        open: 100,
+        high: 100.2,
+        low: 99.8,
+        close: 100,
+        volume: 1,
+      });
+    }
+    bars[6] = { time: bars[6]!.time, open: 100, high: 109.5, low: 100.1, close: 105, volume: 1 };
+    bars[7] = { time: bars[7]!.time, open: 105, high: 105.2, low: 99.5, close: 100, volume: 1 };
+    bars[8] = { time: bars[8]!.time, open: 100, high: 112.5, low: 99.5, close: 112, volume: 1 };
+    const signals: Signal[] = [
+      {
+        barIndex: 5,
+        barTime: bars[5]!.time,
+        indicator: "TREX12",
+        side: "long",
+        entry: 100,
+        sl: 90,
+        tp: 112,
+        rr: 1.2,
+        atr: 1,
+        beAtR: 1,
+        reason: "test",
+      },
+    ];
+    const sim = simulateTrades(signals, bars, {
+      equity: 10_000,
+      capitalPct: 10,
+      leverage: 10,
+      symbol: "BTCUSDT",
+      timeframe: "15m",
+    });
+    assert.equal(sim.trades.length, 1);
+    assert.equal(sim.trades[0]!.reason, "tp");
+    assert.equal(sim.trades[0]!.exit, 112);
   });
 
   it("does not move APEX stops — no beAtR means original SL/TP path", () => {

@@ -187,8 +187,8 @@ function Page() {
             </li>
             <li>
               {fa
-                ? "TREX 1.0R و 1.2R: باند ۰.۷۰ ATR، HTF EMA50، کف استاپ/تارگت ۰.۵٪، BE@۰.۳۵ / ۰.۳۲. پارامترها دقیقاً همان دو فایل ۱۵م هستند."
-                : "TREX 1.0R and 1.2R: 0.70 ATR band, HTF EMA50, 0.5% stop/target floors, BE@0.35 / 0.32. Parameters match the two 15m files exactly."}
+                ? "TREX 1.0R و 1.2R: باند ۰.۷۰ ATR، HTF EMA50، کف استاپ/تارگت ۰.۵٪، BE@۱R. پارامترهای ورود دقیقاً همان دو فایل ۱۵م هستند."
+                : "TREX 1.0R and 1.2R: 0.70 ATR band, HTF EMA50, 0.5% stop/target floors, BE@1R. Entry parameters match the two 15m files exactly."}
             </li>
             <li>
               {fa
@@ -276,7 +276,7 @@ TP     = FTC ± R × slDist
 APEX 1 / 1.5 / 2     R from profile
 Aegis / Vesper / Orion  1.0 / 1.5 / 2.0
 Coil HALC               2.2
-TREX 1.0 / 1.2          then BE @ 0.35R / 0.32R → SL = entry
+TREX 1.0 / 1.2          then BE @ 1.0R → SL = entry
 KETEX                   2.2 · no BE
 SHETEX                  1.8 · no BE
 same-bar SL+TP → SL`}
