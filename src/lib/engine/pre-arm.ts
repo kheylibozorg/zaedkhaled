@@ -968,8 +968,7 @@ function findTrexPreArm(
             supBar,
             minStopPct: p.minStopPct,
             minTpPct: p.minTpPct,
-            beAtR: p.beAtR,
-            reasonTag: `TREX ${p.rr}R second-test support · Pre-arm FTC limit · BE@${p.beAtR}R`,
+            reasonTag: `TREX ${p.rr}R second-test support · Pre-arm FTC limit`,
           });
           if (cand && (!bestLong || Math.abs(cand.entry - bar.close) < Math.abs(bestLong.entry - bar.close))) {
             bestLong = cand;
@@ -1002,8 +1001,7 @@ function findTrexPreArm(
             supBar,
             minStopPct: p.minStopPct,
             minTpPct: p.minTpPct,
-            beAtR: p.beAtR,
-            reasonTag: `TREX ${p.rr}R second-test resistance · Pre-arm FTC limit · BE@${p.beAtR}R`,
+            reasonTag: `TREX ${p.rr}R second-test resistance · Pre-arm FTC limit`,
           });
           if (cand && (!bestShort || Math.abs(cand.entry - bar.close) < Math.abs(bestShort.entry - bar.close))) {
             bestShort = cand;

@@ -19,7 +19,7 @@ const FTC_MIN_ATR = 0.2;
 export type TrexProfile = {
   name: TrexName;
   rr: number;
-  beAtR: number;
+  beAtR?: number;
   legLookback: number;
   minLegAtr: number;
   coverMax: 1 | 2;
@@ -37,7 +37,6 @@ export type TrexProfile = {
 const TREX1: TrexProfile = {
   name: "TREX1",
   rr: 1,
-  beAtR: 1,
   legLookback: 40,
   minLegAtr: 2,
   coverMax: 2,
@@ -55,7 +54,6 @@ const TREX1: TrexProfile = {
 const TREX12: TrexProfile = {
   name: "TREX12",
   rr: 1.2,
-  beAtR: 1,
   legLookback: 40,
   minLegAtr: 2.4,
   coverMax: 2,
@@ -74,9 +72,7 @@ export function trexProfile(name: TrexName): TrexProfile {
   return name === "TREX12" ? { ...TREX12 } : { ...TREX1 };
 }
 
-export function trexBeAtR(name: string): number | null {
-  if (name === "TREX1") return TREX1.beAtR;
-  if (name === "TREX12") return TREX12.beAtR;
+export function trexBeAtR(_name: string): number | null {
   return null;
 }
 
@@ -506,8 +502,7 @@ export function runTrexEngine(
               tp: armFtc + p.rr * slDist,
               rr: p.rr,
               atr: a,
-              beAtR: p.beAtR,
-              reason: `TREX ${p.rr}R second-test support · FTC tag · BE@${p.beAtR}R`,
+              reason: `TREX ${p.rr}R second-test support · FTC tag`,
             });
           } else if (armDir === -1) {
             signals.push({
@@ -520,8 +515,7 @@ export function runTrexEngine(
               tp: armFtc - p.rr * slDist,
               rr: p.rr,
               atr: a,
-              beAtR: p.beAtR,
-              reason: `TREX ${p.rr}R second-test resistance · FTC tag · BE@${p.beAtR}R`,
+              reason: `TREX ${p.rr}R second-test resistance · FTC tag`,
             });
           }
         }
@@ -557,12 +551,11 @@ export function runTrexEngine(
           tp: armDir === 1 ? armFtc + p.rr * slDist : armFtc - p.rr * slDist,
           rr: p.rr,
           atr: Number.isFinite(armAtr) ? armAtr : a,
-          beAtR: p.beAtR,
           armAge,
           ftcWait: p.ftcWait,
           armedBarIndex: armBarIdx,
           armedBarTime: bars[armBarIdx]!.time,
-          reason: `TREX ${p.rr}R second-test ${side === "long" ? "support" : "resistance"} · FTC limit · BE@${p.beAtR}R`,
+          reason: `TREX ${p.rr}R second-test ${side === "long" ? "support" : "resistance"} · FTC limit`,
         };
       }
     }

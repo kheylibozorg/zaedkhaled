@@ -359,14 +359,14 @@ function Home() {
             {
               k: "1.0R",
               name: "TREX 1.0R",
-              fa: "تست دوم پیوت زنده · ورود FTC · بعد از +۱R استاپ به ورود · هر دو سمت",
-              en: "Second-test live pivot · FTC entry · stop to BE after +1R · both sides",
+              fa: "تست دوم پیوت زنده · ورود FTC · بدون BE · هر دو سمت",
+              en: "Second-test live pivot · FTC entry · no BE · both sides",
             },
             {
               k: "1.2R",
               name: "TREX 1.2R",
-              fa: "همان اسکلت · تارگت ۱.۲R · BE@۱R · لگ و اتاق سخت‌تر",
-              en: "Same skeleton · 1.2R target · BE@1R · stricter leg and room",
+              fa: "همان اسکلت · تارگت ۱.۲R · بدون BE · لگ و اتاق سخت‌تر",
+              en: "Same skeleton · 1.2R target · no BE · stricter leg and room",
             },
             {
               k: "2.2R",
@@ -991,8 +991,8 @@ function Home() {
           <h2 className="mb-1 text-sm font-medium">{t.positions}</h2>
           <p className="mb-3 text-xs text-subtle">
             {locale === "fa"
-              ? "ستون TP همان تارگت است: APEX 1R · 1.5R · 2R، HALCYON 1R · 1.5R · 2R · 2.2R، TREX 1.0R · 1.2R، KETEX 2.2R، SHETEX 1.8R. کاغذی را ربات روی کندل ۵دقیقه می‌بندد؛ زنده را خود صرافی با سفارش محافظ. TREX بعد از BE استاپ را به ورود می‌کشد."
-              : "The TP column is the target: APEX 1R · 1.5R · 2R, HALCYON 1R · 1.5R · 2R · 2.2R, TREX 1.0R · 1.2R, KETEX 2.2R, SHETEX 1.8R. Paper exits on the 5m bar; live attaches a protective order on the venue. TREX moves the stop to entry after BE."}
+              ? "ستون TP همان تارگت است: APEX 1R · 1.5R · 2R، HALCYON 1R · 1.5R · 2R · 2.2R، TREX 1.0R · 1.2R، KETEX 2.2R، SHETEX 1.8R. کاغذی را ربات روی کندل ۵دقیقه می‌بندد؛ زنده را خود صرافی با سفارش محافظ."
+              : "The TP column is the target: APEX 1R · 1.5R · 2R, HALCYON 1R · 1.5R · 2R · 2.2R, TREX 1.0R · 1.2R, KETEX 2.2R, SHETEX 1.8R. Paper exits on the 5m bar; live attaches a protective order on the venue."}
           </p>
           <PositionsTable rows={data.open} empty={t.noPositions} />
         </section>
