@@ -4,6 +4,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { defaultMaxLeverage } from "@/lib/market/binance";
 import { coinOf, isTradeableBase, nativeSymbol } from "./meta";
 import { capLeverage } from "./lev-cap";
+import { rebaseStopsFromFill } from "@/lib/engine/paper";
 import type {
   ExchangeAdapter,
   ExchangeAccount,
@@ -617,15 +618,37 @@ export const hyperliquidAdapter: ExchangeAdapter = {
         | { resting?: { oid?: number }; filled?: { oid?: number; avgPx?: string; totalSz?: string } }
         | undefined;
       if (st?.filled?.oid != null) {
+        const fillPx = Number(st.filled.avgPx ?? 0) || order.entry;
+        const filledQty = Number(st.filled.totalSz ?? 0) || Number(sz);
+        const rebased = rebaseStopsFromFill({
+          paperEntry: order.entry || fillPx,
+          fill: fillPx,
+          sl: Number(slPx),
+          tp: Number(tpPx),
+        });
+        const finalSlPx = formatPrice(rebased.sl, szDec);
+        const finalTpPx = formatPrice(rebased.tp, szDec);
+        if (
+          Math.abs(Number(finalSlPx) - Number(slPx)) / Math.max(1e-12, fillPx) > 1e-4 ||
+          Math.abs(Number(finalTpPx) - Number(tpPx)) / Math.max(1e-12, fillPx) > 1e-4
+        ) {
+          await this.updateStop(account, {
+            symbol: order.symbol,
+            side: order.side,
+            sl: Number(finalSlPx),
+            tp: Number(finalTpPx),
+            qty: filledQty,
+          }).catch(() => undefined);
+        }
         return {
           ok: true,
           filled: true,
           resting: false,
           orderId: String(st.filled.oid),
-          fillPrice: Number(st.filled.avgPx ?? 0) || order.entry,
-          filledQty: Number(st.filled.totalSz ?? 0) || Number(sz),
-          sl: Number(slPx),
-          tp: Number(tpPx),
+          fillPrice: fillPx,
+          filledQty,
+          sl: Number(finalSlPx),
+          tp: Number(finalTpPx),
           message: `Hyperliquid GTC limit filled immediately · SL/TP on venue`,
         };
       }
@@ -773,13 +796,13 @@ export const hyperliquidAdapter: ExchangeAdapter = {
             /* new pair is live */
           }
         }
-        return { ok: true, message: "Hyperliquid SL moved to BE · TP kept" };
+        return { ok: true, message: "Hyperliquid SL/TP synced" };
       }
       return {
         ok: false,
         message:
           allOrderErrors(first) ||
-          "Hyperliquid BE stop did not confirm — original SL kept",
+          "Hyperliquid stop sync did not confirm — original SL kept",
       };
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : "Hyperliquid update stop failed" };
@@ -867,9 +890,20 @@ export const hyperliquidAdapter: ExchangeAdapter = {
     }
     try {
       const opens = await listTriggers(account, hit.coin);
-      const hasSl = opens.some((o) => Boolean(o.isTrigger) && o.reduceOnly !== false && o.tpsl === "sl");
-      const hasTp = opens.some((o) => Boolean(o.isTrigger) && o.reduceOnly !== false && o.tpsl === "tp");
-      return { onVenue, hasSl, hasTp, unknown: false };
+      const slOrder = opens.find((o) => Boolean(o.isTrigger) && o.reduceOnly !== false && o.tpsl === "sl");
+      const tpOrder = opens.find((o) => Boolean(o.isTrigger) && o.reduceOnly !== false && o.tpsl === "tp");
+      const slPx = Number(slOrder?.triggerPx ?? 0);
+      const tpPx = Number(tpOrder?.triggerPx ?? 0);
+      const slOk = Boolean(slOrder) && (!(input.sl > 0) || pxClose(slPx, input.sl));
+      const tpOk = Boolean(tpOrder) && (!(input.tp > 0) || pxClose(tpPx, input.tp));
+      return {
+        onVenue,
+        hasSl: slOk,
+        hasTp: tpOk,
+        unknown: false,
+        slPrice: slPx > 0 ? slPx : undefined,
+        tpPrice: tpPx > 0 ? tpPx : undefined,
+      };
     } catch {
       return { onVenue, hasSl: false, hasTp: false, unknown: true };
     }

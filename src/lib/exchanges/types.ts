@@ -65,6 +65,8 @@ export type ProtectionSnapshot = {
   hasSl: boolean;
   hasTp: boolean;
   unknown: boolean;
+  slPrice?: number;
+  tpPrice?: number;
 };
 
 export type ListedMarket = {

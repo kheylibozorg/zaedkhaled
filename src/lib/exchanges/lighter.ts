@@ -312,9 +312,11 @@ export function classifyLighterProtection(
   orders: LighterActiveOrder[],
   sl: number,
   tp: number,
-): { hasSl: boolean; hasTp: boolean } {
+): { hasSl: boolean; hasTp: boolean; slPrice?: number; tpPrice?: number } {
   let hasSl = false;
   let hasTp = false;
+  let slPrice: number | undefined;
+  let tpPrice: number | undefined;
   const pxClose = (a: number, b: number) => {
     if (!(a > 0) || !(b > 0)) return false;
     return Math.abs(a - b) / Math.max(a, b) < 0.025;
@@ -332,6 +334,7 @@ export function classifyLighterProtection(
       (sl > 0 && pxClose(trigPx, sl) && !pxClose(trigPx, tp))
     ) {
       hasSl = true;
+      if (trigPx > 0 && !slPrice) slPrice = trigPx;
     } else if (
       rawType.includes("take-profit") ||
       rawType === "tp" ||
@@ -340,12 +343,18 @@ export function classifyLighterProtection(
       (tp > 0 && pxClose(trigPx, tp) && !pxClose(trigPx, sl))
     ) {
       hasTp = true;
+      if (trigPx > 0 && !tpPrice) tpPrice = trigPx;
     } else if (trigPx > 0 && sl > 0 && tp > 0) {
-      if (Math.abs(trigPx - sl) <= Math.abs(trigPx - tp)) hasSl = true;
-      else hasTp = true;
+      if (Math.abs(trigPx - sl) <= Math.abs(trigPx - tp)) {
+        hasSl = true;
+        if (!slPrice) slPrice = trigPx;
+      } else {
+        hasTp = true;
+        if (!tpPrice) tpPrice = trigPx;
+      }
     }
   }
-  return { hasSl, hasTp };
+  return { hasSl, hasTp, slPrice, tpPrice };
 }
 
 /** Top-of-book price directly from orderBookOrders scaled with exact priceDecimals. */
@@ -708,13 +717,22 @@ export const lighterAdapter: ExchangeAdapter = {
         const pos = (await this.fetchPositions(account)).find((p) => coinOf(p.symbol) === mkt.coin);
         if (pos?.qty) {
           const fillPx = pos.entry > 0 ? pos.entry : order.entry;
-          const prot = await this.fetchProtection(account, { symbol: order.symbol, sl: order.sl, tp: order.tp });
-          if (prot.unknown || !prot.hasSl || !prot.hasTp) {
+          const rebased = rebaseStopsFromFill({
+            paperEntry: order.entry || fillPx,
+            fill: fillPx,
+            sl: order.sl,
+            tp: order.tp,
+          });
+          const needRebase =
+            Math.abs(rebased.sl - order.sl) / Math.max(1e-12, fillPx) > 1e-4 ||
+            Math.abs(rebased.tp - order.tp) / Math.max(1e-12, fillPx) > 1e-4;
+          const prot = await this.fetchProtection(account, { symbol: order.symbol, sl: rebased.sl, tp: rebased.tp });
+          if (needRebase || prot.unknown || !prot.hasSl || !prot.hasTp) {
             const moved = await this.updateStop(account, {
               symbol: order.symbol,
               side: order.side,
-              sl: order.sl,
-              tp: order.tp,
+              sl: rebased.sl,
+              tp: rebased.tp,
               qty: pos.qty,
             });
             if (!moved.ok) {
@@ -737,8 +755,8 @@ export const lighterAdapter: ExchangeAdapter = {
             orderId: hash,
             fillPrice: fillPx,
             filledQty: pos.qty,
-            sl: order.sl,
-            tp: order.tp,
+            sl: rebased.sl,
+            tp: rebased.tp,
             message: `Lighter limit filled immediately · SL/TP attached`,
           };
         }
@@ -1035,8 +1053,8 @@ export const lighterAdapter: ExchangeAdapter = {
     }
     const orders = await fetchActiveOrdersForMarket(account, mkt.marketIndex);
     if (orders == null) return { onVenue, hasSl: false, hasTp: false, unknown: true };
-    const { hasSl, hasTp } = classifyLighterProtection(orders, input.sl, input.tp);
-    return { onVenue, hasSl, hasTp, unknown: false };
+    const { hasSl, hasTp, slPrice, tpPrice } = classifyLighterProtection(orders, input.sl, input.tp);
+    return { onVenue, hasSl, hasTp, unknown: false, slPrice, tpPrice };
   },
   async testConnection(account) {
     try {

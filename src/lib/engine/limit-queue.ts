@@ -47,6 +47,67 @@ export function isValidLimitGeometry(side: Side, entry: number, sl: number, tp: 
   return side === "long" ? sl < entry && tp > entry : sl > entry && tp < entry;
 }
 
+/**
+ * Verifies that a Pre-Arm limit setup is still strictly anticipatory:
+ * price must NEVER have already reached/crossed entry, breached SL, or hit TP
+ * in either closed 5m bars since the signal bar closed or the current live price.
+ */
+export function isPreArmStillUnreached(opts: {
+  side: Side;
+  entry: number;
+  sl: number;
+  tp: number;
+  lastClosedBarTime: number;
+  timeframe: Timeframe;
+  bars5m?: Bar[];
+  livePrice?: number | null;
+}): { ok: true } | { ok: false; cancelReason: LimitCancelReason } {
+  const { side, entry, sl, tp } = opts;
+  if (!isValidLimitGeometry(side, entry, sl, tp)) {
+    return { ok: false, cancelReason: "pattern failed" };
+  }
+
+  const tfMs = TF_MS[opts.timeframe];
+  const windowStart = opts.lastClosedBarTime > 0 ? opts.lastClosedBarTime + tfMs : 0;
+  if (windowStart > 0 && opts.bars5m?.length) {
+    const after5m = opts.bars5m
+      .filter((b) => b.time >= windowStart)
+      .sort((a, b) => a.time - b.time);
+    for (const bar of after5m) {
+      const slBreached = side === "long" ? bar.low <= sl : bar.high >= sl;
+      if (slBreached) {
+        return { ok: false, cancelReason: "sl engulfed" };
+      }
+      const reachedOrCrossed = side === "long" ? bar.low <= entry : bar.high >= entry;
+      if (reachedOrCrossed) {
+        return { ok: false, cancelReason: "pattern failed" };
+      }
+      const targetWithoutRtp = side === "long" ? bar.high >= tp : bar.low <= tp;
+      if (targetWithoutRtp) {
+        return { ok: false, cancelReason: "target reached without RTP" };
+      }
+    }
+  }
+
+  const live = opts.livePrice;
+  if (live != null && Number.isFinite(live) && live > 0) {
+    const slBreached = side === "long" ? live <= sl : live >= sl;
+    if (slBreached) {
+      return { ok: false, cancelReason: "sl engulfed" };
+    }
+    const reachedOrCrossed = side === "long" ? live <= entry : live >= entry;
+    if (reachedOrCrossed) {
+      return { ok: false, cancelReason: "pattern failed" };
+    }
+    const targetWithoutRtp = side === "long" ? live >= tp : live <= tp;
+    if (targetWithoutRtp) {
+      return { ok: false, cancelReason: "target reached without RTP" };
+    }
+  }
+
+  return { ok: true };
+}
+
 export function canQueueLimitOrder(opts: {
   safeLimitMode: boolean;
   maxPositions: unknown;

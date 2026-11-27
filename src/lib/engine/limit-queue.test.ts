@@ -4,6 +4,7 @@ import {
   canQueueLimitOrder,
   clampLimitTtlBars,
   evaluatePendingLimit,
+  isPreArmStillUnreached,
   parseEntryMode,
   resolveLimitTtlBars,
   type PendingLimitSpec,
@@ -355,3 +356,114 @@ describe("evaluatePendingLimit — style invalidation & fills", () => {
     );
   });
 });
+
+describe("isPreArmStillUnreached — strict anticipatory Pre-Arm check", () => {
+  const bar4h = Date.UTC(2025, 0, 2, 0, 0, 0);
+  const after4h = bar4h + TF_MS["4h"];
+  const m5 = TF_MS["5m"];
+
+  function bar5m(offsetIdx: number, open: number, high: number, low: number, close: number): Bar {
+    return { time: after4h + offsetIdx * m5, open, high, low, close, volume: 100 };
+  }
+
+  it("allows unreached anticipatory Short and Long Pre-Arm orders", () => {
+    assert.deepEqual(
+      isPreArmStillUnreached({
+        side: "short",
+        entry: 100,
+        sl: 105,
+        tp: 90,
+        lastClosedBarTime: bar4h,
+        timeframe: "4h",
+        bars5m: [bar5m(0, 96, 97.5, 95, 96.5), bar5m(1, 96.5, 98.8, 96, 98.2)],
+        livePrice: 98.4,
+      }),
+      { ok: true },
+    );
+    assert.deepEqual(
+      isPreArmStillUnreached({
+        side: "long",
+        entry: 100,
+        sl: 95,
+        tp: 110,
+        lastClosedBarTime: bar4h,
+        timeframe: "4h",
+        bars5m: [bar5m(0, 104, 105, 102.5, 103)],
+        livePrice: 102.1,
+      }),
+      { ok: true },
+    );
+  });
+
+  it("rejects Pre-Arm when live price already crossed entry (would market-fill across spread)", () => {
+    assert.deepEqual(
+      isPreArmStillUnreached({
+        side: "short",
+        entry: 100,
+        sl: 105,
+        tp: 90,
+        lastClosedBarTime: bar4h,
+        timeframe: "4h",
+        bars5m: [bar5m(0, 97, 99, 96.5, 98.5)],
+        livePrice: 100.2,
+      }),
+      { ok: false, cancelReason: "pattern failed" },
+    );
+    assert.deepEqual(
+      isPreArmStillUnreached({
+        side: "long",
+        entry: 100,
+        sl: 95,
+        tp: 110,
+        lastClosedBarTime: bar4h,
+        timeframe: "4h",
+        bars5m: [bar5m(0, 103, 104, 101, 102)],
+        livePrice: 99.8,
+      }),
+      { ok: false, cancelReason: "pattern failed" },
+    );
+  });
+
+  it("rejects Pre-Arm when a closed 5m bar intra-4h already touched or crossed entry, SL, or TP", () => {
+    assert.deepEqual(
+      isPreArmStillUnreached({
+        side: "short",
+        entry: 100,
+        sl: 105,
+        tp: 90,
+        lastClosedBarTime: bar4h,
+        timeframe: "4h",
+        bars5m: [bar5m(0, 97, 100.4, 96.8, 97.5)],
+        livePrice: 97.4,
+      }),
+      { ok: false, cancelReason: "pattern failed" },
+    );
+    assert.deepEqual(
+      isPreArmStillUnreached({
+        side: "short",
+        entry: 100,
+        sl: 105,
+        tp: 90,
+        lastClosedBarTime: bar4h,
+        timeframe: "4h",
+        bars5m: [bar5m(0, 96, 97, 89.5, 92)],
+        livePrice: 92,
+      }),
+      { ok: false, cancelReason: "target reached without RTP" },
+    );
+    assert.deepEqual(
+      isPreArmStillUnreached({
+        side: "long",
+        entry: 100,
+        sl: 95,
+        tp: 110,
+        lastClosedBarTime: bar4h,
+        timeframe: "4h",
+        bars5m: [bar5m(0, 98, 99, 94.8, 97)],
+        livePrice: 101,
+      }),
+      { ok: false, cancelReason: "sl engulfed" },
+    );
+  });
+});
+

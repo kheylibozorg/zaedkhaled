@@ -15,7 +15,7 @@ describe("Lighter unit helpers", () => {
       95,
       110,
     );
-    assert.deepEqual(empty, { hasSl: false, hasTp: false });
+    assert.deepEqual(empty, { hasSl: false, hasTp: false, slPrice: undefined, tpPrice: undefined });
 
     const byType = classifyLighterProtection(
       [
@@ -25,7 +25,7 @@ describe("Lighter unit helpers", () => {
       95,
       110,
     );
-    assert.deepEqual(byType, { hasSl: true, hasTp: true });
+    assert.deepEqual(byType, { hasSl: true, hasTp: true, slPrice: 95, tpPrice: 110 });
 
     const byPrice = classifyLighterProtection(
       [
@@ -35,14 +35,14 @@ describe("Lighter unit helpers", () => {
       95,
       110,
     );
-    assert.deepEqual(byPrice, { hasSl: true, hasTp: true });
+    assert.deepEqual(byPrice, { hasSl: true, hasTp: true, slPrice: 95.1, tpPrice: 109.9 });
 
     const slOnly = classifyLighterProtection(
       [{ order_index: 14, reduce_only: true, type: 2, trigger_price: 95 }],
       95,
       110,
     );
-    assert.deepEqual(slOnly, { hasSl: true, hasTp: false });
+    assert.deepEqual(slOnly, { hasSl: true, hasTp: false, slPrice: 95, tpPrice: undefined });
   });
 
   it("maps Lighter raw trades to signed BUY/SELL VenueTrade rows with fee computation", () => {

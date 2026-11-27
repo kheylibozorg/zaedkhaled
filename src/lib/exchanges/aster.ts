@@ -1,3 +1,4 @@
+import { isAsterProtectiveOrder } from "@/lib/engine/live-reconcile";
 import { rebaseStopsFromFill } from "@/lib/engine/paper";
 import { privateKeyToAccount } from "viem/accounts";
 import { signedQuery } from "./hmac";
@@ -309,7 +310,7 @@ async function asterPlaceOneProtect(
       return "";
     } catch (err) {
       const msg = err instanceof Error ? err.message : "rejected";
-      if (triggerNow(msg)) {
+      if (kind === "tp" && triggerNow(msg)) {
         try {
           await signed(account, "POST", "/fapi/v1/order", {
             symbol,
@@ -336,9 +337,27 @@ async function asterPlaceOneProtect(
       stopPrice: price,
       closePosition: "true",
       workingType: "CONTRACT_PRICE",
+      newClientOrderId: clientId(`c${Date.now()}`),
     });
     return "";
   } catch (err) {
+    if (qty > 0) {
+      try {
+        await signed(account, "POST", "/fapi/v1/order", {
+          symbol,
+          side: closeSide,
+          type: marketType,
+          quantity: qty,
+          stopPrice: price,
+          reduceOnly: "true",
+          workingType: "CONTRACT_PRICE",
+          newClientOrderId: clientId(`d${Date.now()}`),
+        });
+        return "";
+      } catch (err2) {
+        return err2 instanceof Error ? err2.message : err instanceof Error ? err.message : "rejected";
+      }
+    }
     return err instanceof Error ? err.message : "rejected";
   }
 }
@@ -351,13 +370,22 @@ async function asterPlaceStops(
   tp: number,
   qtyHint?: number,
 ): Promise<{ slErr: string; tpErr: string }> {
+  let spec: Spec | undefined;
+  try {
+    const specs = await loadSpecs();
+    spec = specs.find((s) => s.symbol === symbol);
+  } catch {
+    /* keep raw prices if specs unavailable */
+  }
+  const slPx = spec ? roundPrice(sl, spec.tickSize) : sl;
+  const tpPx = spec ? roundPrice(tp, spec.tickSize) : tp;
   const qty = await asterProtectQty(account, symbol, qtyHint);
-  const slErr = await asterPlaceOneProtect(account, symbol, closeSide, "sl", sl, qty);
-  const tpErr = await asterPlaceOneProtect(account, symbol, closeSide, "tp", tp, qty);
+  const slErr = await asterPlaceOneProtect(account, symbol, closeSide, "sl", slPx, qty);
+  const tpErr = await asterPlaceOneProtect(account, symbol, closeSide, "tp", tpPx, qty);
   return { slErr, tpErr };
 }
 
-/** Place new SL/TP first, then drop the previous ones — no unprotected gap. */
+/** Place new SL/TP first, then drop the previous protective ones — no unprotected gap. */
 async function asterReplaceStops(
   account: ExchangeAccount,
   symbol: string,
@@ -370,8 +398,14 @@ async function asterReplaceStops(
   try {
     const opens = (await signed(account, "GET", "/fapi/v1/openOrders", { symbol })) as Array<{
       orderId: number;
+      type?: string;
+      origType?: string;
+      reduceOnly?: boolean | string;
+      clientOrderId?: string;
     }>;
-    oldIds = opens.map((o) => o.orderId);
+    oldIds = (Array.isArray(opens) ? opens : [])
+      .filter((o) => isAsterProtectiveOrder(o) && o.orderId != null)
+      .map((o) => o.orderId);
   } catch {
     /* still place the new pair */
   }
@@ -811,6 +845,47 @@ export const asterAdapter: ExchangeAdapter = {
           message: "Aster limit filled immediately · SL/TP on venue",
         };
       }
+      await sleep(250);
+      const posAmt = await asterPositionAmt(account, order.symbol);
+      if (posAmt != null && posAmt !== 0) {
+        const liveFill = await waitAsterFill(account, order.symbol, data.orderId);
+        const fillPx = liveFill.px > 0 ? liveFill.px : limitPx;
+        const filledQty = liveFill.qty > 0 ? liveFill.qty : Math.abs(posAmt) || qty;
+        const rebased = rebaseStopsFromFill({
+          paperEntry: order.entry || fillPx,
+          fill: fillPx,
+          sl: order.sl,
+          tp: order.tp,
+        });
+        const sl = spec ? roundPrice(rebased.sl, spec.tickSize) : rebased.sl;
+        const tp = spec ? roundPrice(rebased.tp, spec.tickSize) : rebased.tp;
+        const { slErr, tpErr } = await asterPlaceStops(account, order.symbol, closeSide, sl, tp, filledQty);
+        if (slErr || tpErr) {
+          const missing = [slErr && `SL: ${slErr}`, tpErr && `TP: ${tpErr}`].filter(Boolean).join(" · ");
+          try {
+            const closed = await closeAndDisarm(account, order.symbol);
+            return flattenMessage(closed, `Aster limit filled but ${missing}`, oid);
+          } catch (err) {
+            return {
+              ok: false,
+              liveOpen: true,
+              orderId: oid,
+              message: `Aster limit filled but ${missing} — flatten failed (${err instanceof Error ? err.message : "close threw"})`,
+            };
+          }
+        }
+        return {
+          ok: true,
+          filled: true,
+          resting: false,
+          orderId: oid,
+          fillPrice: fillPx,
+          filledQty,
+          sl,
+          tp,
+          message: "Aster limit filled immediately · SL/TP on venue",
+        };
+      }
       return {
         ok: true,
         resting: true,
@@ -957,6 +1032,9 @@ export const asterAdapter: ExchangeAdapter = {
           origType?: string;
           workingType?: string;
           clientOrderId?: string;
+          stopPrice?: string;
+          price?: string;
+          reduceOnly?: boolean | string;
         }>;
       let opens = await loadOpens();
       const needsPaperLimit = opens.some((o) => {
@@ -981,13 +1059,23 @@ export const asterAdapter: ExchangeAdapter = {
       }
       let hasSl = false;
       let hasTp = false;
+      let slPrice: number | undefined;
+      let tpPrice: number | undefined;
+      const matchesTarget = (px: number, want: number) =>
+        !(want > 0) || (px > 0 && Math.abs(px - want) / Math.max(1e-12, want) <= 0.015);
       for (const o of opens) {
         const typ = `${o.type ?? ""} ${o.origType ?? ""}`.toUpperCase();
         const cid = String(o.clientOrderId ?? "").toLowerCase();
-        if (typ.includes("TAKE_PROFIT") || cid.startsWith("ptp")) hasTp = true;
-        else if (isStopType(o.type ?? "", o.origType ?? "") || cid.startsWith("psl")) hasSl = true;
+        const px = Number(o.stopPrice ?? o.price ?? 0);
+        if (typ.includes("TAKE_PROFIT") || cid.startsWith("ptp")) {
+          if (px > 0 && !tpPrice) tpPrice = px;
+          if (matchesTarget(px, input.tp)) hasTp = true;
+        } else if (isStopType(o.type ?? "", o.origType ?? "") || cid.startsWith("psl")) {
+          if (px > 0 && !slPrice) slPrice = px;
+          if (matchesTarget(px, input.sl)) hasSl = true;
+        }
       }
-      return { onVenue, hasSl, hasTp, unknown: false };
+      return { onVenue, hasSl, hasTp, unknown: false, slPrice, tpPrice };
     } catch {
       return { onVenue, hasSl: false, hasTp: false, unknown: true };
     }

@@ -1039,6 +1039,32 @@ export async function getLimitOrderById(id: number): Promise<LimitOrderRow | nul
   return rows[0] ?? null;
 }
 
+export async function hasLimitOrderForBar(opts: {
+  symbol: string;
+  timeframe: string;
+  indicator: string;
+  armedBarTime: number;
+}): Promise<boolean> {
+  const sql = await getSql();
+  await ensureTickHardeningColumns(sql);
+  try {
+    const rows = await sql<{ id: number }>`
+      select id from limit_orders
+      where symbol = ${opts.symbol}
+        and timeframe = ${opts.timeframe}
+        and indicator = ${opts.indicator}
+        and armed_bar_time = ${opts.armedBarTime}
+        and status <> 'watch'
+      limit 1
+    `;
+    return Boolean(rows[0]?.id);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/limit_orders|does not exist/i.test(msg)) return false;
+    throw err;
+  }
+}
+
 export async function insertLimitOrder(o: {
   mode: string;
   venue: string;
@@ -1460,6 +1486,33 @@ export async function seedDemoJournal() {
 export async function updatePositionSl(id: number, sl: number) {
   const sql = await getSql();
   await sql`update positions set sl = ${sl} where id = ${id} and status = 'open'`;
+}
+
+export async function updatePositionStops(id: number, sl: number, tp: number) {
+  const sql = await getSql();
+  await sql`update positions set sl = ${sl}, tp = ${tp} where id = ${id} and status = 'open'`;
+}
+
+export async function updatePositionEntryAndStops(
+  id: number,
+  entry: number,
+  sl: number,
+  tp: number,
+) {
+  const sql = await getSql();
+  try {
+    await sql`
+      update positions
+      set entry = ${entry}, sl = ${sl}, tp = ${tp}, orig_sl = ${sl}
+      where id = ${id} and status = 'open'
+    `;
+  } catch {
+    await sql`
+      update positions
+      set entry = ${entry}, sl = ${sl}, tp = ${tp}
+      where id = ${id} and status = 'open'
+    `;
+  }
 }
 
 export async function bumpEquity(delta: number) {

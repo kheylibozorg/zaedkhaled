@@ -254,7 +254,16 @@ async function ourbitHoldVol(account: ExchangeAccount, symbol: string): Promise<
   }
 }
 
-type Protection = { size: number; hasSl: boolean; hasTp: boolean; sideLong: boolean; unknown: boolean; fill: number };
+type Protection = {
+  size: number;
+  hasSl: boolean;
+  hasTp: boolean;
+  sideLong: boolean;
+  unknown: boolean;
+  fill: number;
+  slPrice?: number;
+  tpPrice?: number;
+};
 
 async function listStops(account: ExchangeAccount, symbol: string): Promise<Array<Record<string, unknown>>> {
   const out: Array<Record<string, unknown>> = [];
@@ -279,8 +288,12 @@ async function readProtection(account: ExchangeAccount, symbol: string, sl: numb
   const size = Math.abs(Number(pos?.holdVol ?? 0));
   const sideLong = pos ? posLong(pos) : true;
   const fill = Number(pos?.holdAvgPrice ?? pos?.openAvgPrice ?? 0);
-  let hasSl = pxClose(Number(pos?.stopLossPrice ?? 0), sl) || Number(pos?.stopLossPrice ?? 0) > 0;
-  let hasTp = pxClose(Number(pos?.takeProfitPrice ?? 0), tp) || Number(pos?.takeProfitPrice ?? 0) > 0;
+  const posSl = Number(pos?.stopLossPrice ?? 0);
+  const posTp = Number(pos?.takeProfitPrice ?? 0);
+  let hasSl = posSl > 0 && (sl > 0 ? pxClose(posSl, sl) : true);
+  let hasTp = posTp > 0 && (tp > 0 ? pxClose(posTp, tp) : true);
+  let slPrice = posSl > 0 ? posSl : undefined;
+  let tpPrice = posTp > 0 ? posTp : undefined;
   if (!hasSl || !hasTp) {
     const opens = await listStops(account, symbol);
     for (const o of opens) {
@@ -289,11 +302,21 @@ async function readProtection(account: ExchangeAccount, symbol: string, sl: numb
       if (Number.isFinite(stNum) && stNum !== 1 && stNum !== 0) continue;
       const blob = `${o.state ?? ""} ${o.triggerSide ?? ""} ${o.stopLossPrice ?? ""} ${o.takeProfitPrice ?? ""} ${o.triggerPrice ?? ""}`.toUpperCase();
       const px = Number(o.stopLossPrice ?? o.takeProfitPrice ?? o.triggerPrice ?? o.price ?? 0);
-      if (blob.includes("LOSS") || pxClose(px, sl) || Number(o.stopLossPrice ?? 0) > 0) hasSl = true;
-      if (blob.includes("PROFIT") || pxClose(px, tp) || Number(o.takeProfitPrice ?? 0) > 0) hasTp = true;
+      const isSl = (blob.includes("LOSS") || Number(o.stopLossPrice ?? 0) > 0) && (sl > 0 ? pxClose(Number(o.stopLossPrice ?? 0) || px, sl) : true);
+      const isTp = (blob.includes("PROFIT") || Number(o.takeProfitPrice ?? 0) > 0) && (tp > 0 ? pxClose(Number(o.takeProfitPrice ?? 0) || px, tp) : true);
+      if (isSl || (sl > 0 && pxClose(px, sl))) {
+        hasSl = true;
+        const sPx = Number(o.stopLossPrice ?? 0) || px;
+        if (sPx > 0 && !slPrice) slPrice = sPx;
+      }
+      if (isTp || (tp > 0 && pxClose(px, tp))) {
+        hasTp = true;
+        const tPx = Number(o.takeProfitPrice ?? 0) || px;
+        if (tPx > 0 && !tpPrice) tpPrice = tPx;
+      }
     }
   }
-  return { size, hasSl, hasTp, sideLong, unknown: false, fill };
+  return { size, hasSl, hasTp, sideLong, unknown: false, fill, slPrice, tpPrice };
 }
 
 async function attachStops(
@@ -786,9 +809,20 @@ export const ourbitAdapter: ExchangeAdapter = {
       if (pos && Number(pos.holdVol ?? 0) > 0) {
         const fillPx = Number(pos.holdAvgPrice ?? pos.openAvgPrice ?? limitPx);
         const filledQty = coinsOf(spec, Number(pos.holdVol ?? vol));
-        const prot = await readProtection(account, spec.symbol, slPx, tpPx);
-        if (!prot.unknown && !(prot.hasSl && prot.hasTp)) {
-          const placed = await attachStops(account, spec, pos, slPx, tpPx);
+        const rebased = rebaseStopsFromFill({
+          paperEntry: limitPx || fillPx,
+          fill: fillPx || limitPx,
+          sl: slPx,
+          tp: tpPx,
+        });
+        const finalSl = roundPrice(rebased.sl, spec.priceUnit);
+        const finalTp = roundPrice(rebased.tp, spec.priceUnit);
+        const needRebase =
+          Math.abs(finalSl - slPx) / Math.max(1e-12, fillPx || 1) > 1e-4 ||
+          Math.abs(finalTp - tpPx) / Math.max(1e-12, fillPx || 1) > 1e-4;
+        const prot = await readProtection(account, spec.symbol, finalSl, finalTp);
+        if (needRebase || (!prot.unknown && !(prot.hasSl && prot.hasTp))) {
+          const placed = await attachStops(account, spec, pos, finalSl, finalTp);
           if (placed.slErr || placed.tpErr) {
             return flattenUnconfirmed(account, spec.symbol, "OURBIT limit filled without SL/TP", oid);
           }
@@ -800,8 +834,8 @@ export const ourbitAdapter: ExchangeAdapter = {
           orderId: oid,
           fillPrice: fillPx,
           filledQty,
-          sl: slPx,
-          tp: tpPx,
+          sl: finalSl,
+          tp: finalTp,
           message: `OURBIT limit filled immediately · SL/TP on venue`,
         };
       }
@@ -882,10 +916,39 @@ export const ourbitAdapter: ExchangeAdapter = {
       if (!pos) return { ok: false, message: "OURBIT position gone before stop move" };
       const sl = roundPrice(order.sl, spec.priceUnit);
       const tp = roundPrice(order.tp, spec.priceUnit);
-      await cancelProtect(account, spec.symbol);
+      const existing = await listStops(account, spec.symbol);
       const placed = await attachStops(account, spec, pos, sl, tp);
-      if (placed.slErr) return { ok: false, message: placed.slErr };
-      return { ok: true, message: placed.tpErr ? "OURBIT SL moved to BE · TP kept" : "OURBIT SL/TP moved onto live fill" };
+      if (placed.slErr || placed.tpErr) {
+        const missing = [placed.slErr && `SL: ${placed.slErr}`, placed.tpErr && `TP: ${placed.tpErr}`]
+          .filter(Boolean)
+          .join(" · ");
+        return { ok: false, message: missing || "OURBIT update stop failed" };
+      }
+      for (const old of existing) {
+        const oid = old.id ?? old.orderId ?? old.stopOrderId ?? old.planOrderId;
+        if (!oid) continue;
+        const oldSl = Number(old.stopLossPrice ?? 0);
+        const oldTp = Number(old.takeProfitPrice ?? 0);
+        const oldTrig = Number(old.triggerPrice ?? old.price ?? 0);
+        if (
+          (oldSl > 0 && pxClose(oldSl, sl)) ||
+          (oldTp > 0 && pxClose(oldTp, tp)) ||
+          (oldTrig > 0 && (pxClose(oldTrig, sl) || pxClose(oldTrig, tp)))
+        ) {
+          continue;
+        }
+        const idNum = Number(oid);
+        const payload = Number.isFinite(idNum) ? [idNum] : [String(oid)];
+        for (const cancelPath of ["/api/v1/private/stoporder/cancel", "/api/v1/private/planorder/cancel"]) {
+          try {
+            await signed(account, "POST", cancelPath, payload);
+            break;
+          } catch {
+            /* try next cancel shape */
+          }
+        }
+      }
+      return { ok: true, message: "OURBIT SL/TP moved onto live fill" };
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : "OURBIT update stop failed" };
     }
@@ -956,7 +1019,14 @@ export const ourbitAdapter: ExchangeAdapter = {
     }
     const prot = await readProtection(account, input.symbol, input.sl, input.tp);
     if (prot.unknown) return { onVenue: false, hasSl: false, hasTp: false, unknown: true };
-    return { onVenue: prot.size > 0, hasSl: prot.hasSl, hasTp: prot.hasTp, unknown: false };
+    return {
+      onVenue: prot.size > 0,
+      hasSl: prot.hasSl,
+      hasTp: prot.hasTp,
+      unknown: false,
+      slPrice: prot.slPrice,
+      tpPrice: prot.tpPrice,
+    };
   },
   async testConnection(account) {
     try {
